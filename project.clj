@@ -3,4 +3,5 @@
   :url "https://github.com/atakeuchii/my-redis"
   :dependencies [[org.clojure/clojure "1.12.5"]]
   :profiles {:dev {:dependencies [[org.clojure/test.check "1.1.1"]]}}
+  :global-vars {*warn-on-reflection* true}
   :repl-options {:init-ns my-redis.core})
