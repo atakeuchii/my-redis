@@ -59,13 +59,14 @@
 (defn start!
   [port]
   (let [socket (ServerSocket. port)
+        actual-port (.getLocalPort socket)
         state (atom {:socket socket
-                     :port port
+                     :port actual-port
                      :running? true
                      :connections #{}})]
     (future
       (try
-        (println (format "[server] listening on %d" port))
+        (println (format "[server] listening on %d" actual-port))
         (loop []
           (let [sock (.accept socket)]
             (future (serve-connection! state sock))
