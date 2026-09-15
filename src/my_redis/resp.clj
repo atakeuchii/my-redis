@@ -32,6 +32,16 @@
           (do (.write baos (int b))
               (recur)))))))
 
+(defn- read-inline-line!
+  ^bytes [^InputStream in]
+  (let [baos (ByteArrayOutputStream.)]
+    (loop []
+      (let [b (read-byte! in)]
+        (cond
+          (== b LF) (.toByteArray baos)
+          (== b CR) (recur)
+          :else (do (.write baos (int b)) (recur)))))))
+
 (defn- read-line-str!
   ^String [^InputStream in]
   (String. (read-line-bytes! in) "UTF-8"))
@@ -79,7 +89,7 @@
 
 (defn- read-inline-command!
   [^InputStream in ^long first-byte]
-  (let [rest-bytes (read-line-bytes! in)
+  (let [rest-bytes (read-inline-line! in)
         baos (ByteArrayOutputStream.)]
     (.write baos (int first-byte))
     (.write baos rest-bytes)
@@ -103,6 +113,7 @@
                 (when-not (== lf LF)
                   (throw (ex-info "protocol error: expected LF after CR" {:got lf})))
                 nil)
+      \newline nil
       (read-inline-command! in b))))
 
 (defn simple 
