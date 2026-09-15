@@ -6,11 +6,22 @@
 
 (defn- handle-command
   [cmd]
-  (println "[cmd]" (pr-str cmd))
   (when (seq cmd)
-    (let [name (str/upper-case (first cmd))]
+    (let [name (str/upper-case (first cmd))
+          args (rest cmd)]
       (case name
-        "PING" (resp/simple "PONG")
+        "PING" (if (seq args)
+                 (first args)
+                 (resp/simple "PONG"))
+        
+        "ECHO" (if (= 1 (count args))
+                 (first args)
+                 (resp/error "ERR wrong number of arguments for 'echo' command"))
+        
+        "COMMAND" []
+
+        "QUIT" :quit
+
         (resp/error (str "ERR unknown command '" (first cmd) "'"))))))
 
 (defn- serve-connection!
@@ -21,11 +32,20 @@
     (let [in (BufferedInputStream. (.getInputStream sock))
           out (BufferedOutputStream. (.getOutputStream sock))]
       (loop []
-        (let [cmd (resp/read-reply in)]
-          (when-let [reply (handle-command cmd)]
-            (resp/write-reply! out reply)
-            (.flush out))
-          (recur))))
+        (let [cmd (resp/read-reply in)
+              reply (handle-command cmd)]
+          (cond
+            (= reply :quit)
+            (do (resp/write-reply! out (resp/simple "OK"))
+                (.flush out))
+            
+            (some? reply)
+            (do (resp/write-reply! out reply)
+                (.flush out)
+                (recur))
+            
+            :else
+            (recur)))))
     (catch EOFException _ nil) ; クライアントが切断。正常終了
     (catch SocketException _ nil) ; 接続が切れた。正常終了
     (catch Exception e
