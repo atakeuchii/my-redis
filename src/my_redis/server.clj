@@ -1,28 +1,9 @@
 (ns my-redis.server
-  (:require [clojure.string :as str]
+  (:require [my-redis.command :as command]
+            [my-redis.db :as db]
             [my-redis.resp :as resp])
   (:import [java.net ServerSocket Socket SocketException]
            [java.io BufferedInputStream BufferedOutputStream EOFException]))
-
-(defn- handle-command
-  [cmd]
-  (when (seq cmd)
-    (let [name (str/upper-case (first cmd))
-          args (rest cmd)]
-      (case name
-        "PING" (if (seq args)
-                 (first args)
-                 (resp/simple "PONG"))
-        
-        "ECHO" (if (= 1 (count args))
-                 (first args)
-                 (resp/error "ERR wrong number of arguments for 'echo' command"))
-        
-        "COMMAND" []
-
-        "QUIT" :quit
-
-        (resp/error (str "ERR unknown command '" (first cmd) "'"))))))
 
 (defn- serve-connection!
   [server-state ^Socket sock]
@@ -30,22 +11,23 @@
     (.setTcpNoDelay sock true)
     (swap! server-state update :connections conj sock)
     (let [in (BufferedInputStream. (.getInputStream sock))
-          out (BufferedOutputStream. (.getOutputStream sock))]
+          out (BufferedOutputStream. (.getOutputStream sock))
+          ctx {:db (:db @server-state)}]
       (loop []
         (let [cmd (resp/read-reply in)
-              reply (handle-command cmd)]
+              reply (command/dispatch ctx cmd)]
           (cond
+            (= reply :no-reply)
+            (recur)
+
             (= reply :quit)
             (do (resp/write-reply! out (resp/simple "OK"))
                 (.flush out))
             
-            (some? reply)
+            :else
             (do (resp/write-reply! out reply)
                 (.flush out)
-                (recur))
-            
-            :else
-            (recur)))))
+                (recur))))))
     (catch EOFException _ nil) ; クライアントが切断。正常終了
     (catch SocketException _ nil) ; 接続が切れた。正常終了
     (catch Exception e
@@ -63,7 +45,8 @@
         state (atom {:socket socket
                      :port actual-port
                      :running? true
-                     :connections #{}})]
+                     :connections #{}
+                     :db (db/create)})]
     (future
       (try
         (println (format "[server] listening on %d" actual-port))
@@ -72,7 +55,7 @@
             (future (serve-connection! state sock))
             (recur)))
         (catch SocketException e
-          (if (:running? state)
+          (if (:running? @state)
             (println "[server] accept error:" (.getMessage e))
             (println "[server] stopped")))
         (catch Exception e
