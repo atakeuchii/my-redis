@@ -50,8 +50,9 @@
 
 (defn delete-many!
   [db ks]
-  (let [[old _] (swap-vals! db #(apply dissoc % ks))]
-    (count (filter #(contains? old %) ks))))
+  (let [uniq (distinct ks)
+        [old _] (swap-vals! db #(apply dissoc % uniq))]
+    (count (filter #(contains? old %) uniq))))
 
 (defn clear!
   [db]
