@@ -21,6 +21,11 @@
 (defn- byte-length ^long [^String s]
   (alength (.getBytes s "UTF-8")))
 
+(defn- parse-long-or-nil
+  [^String s]
+  (try (Long/parseLong s)
+       (catch NumberFormatException _ nil)))
+
 (defn- cmd-ping [_ctx args]
   (if (seq args)
     (first args)
@@ -35,12 +40,64 @@
 (defn- cmd-quit [_ctx _args]
   :quit)
 
+(defn- parse-set-options
+  "SET のオプションをパースする。
+   成功: {:ttl <ミリ秒 or nil> :exists <:nx / :xx / nil>}
+   失敗: {:error <RespError>}"
+  [opts]
+  (loop [opts (seq opts)
+         acc  {:ttl nil :exists nil :ttl-unit nil}]
+    (if-not opts
+      (dissoc acc :ttl-unit)
+      (let [o (str/upper-case (first opts))]
+        (case o
+          ("EX" "PX")
+          (cond
+            (:ttl-unit acc) {:error (resp/error "ERR syntax error")}
+            (nil? (second opts)) {:error (resp/error "ERR syntax error")}
+            :else
+            (if-let [n (parse-long-or-nil (second opts))]
+              (if (pos? n)
+                (recur (nnext opts)
+                       (assoc acc
+                              :ttl (if (= o "EX") (* n 1000) n)
+                              :ttl-unit o))
+                {:error (resp/error "ERR invalid expire time in 'set' command")})
+              {:error not-integer-error}))
+
+          "NX"
+          (if (:exists acc)
+            {:error (resp/error "ERR syntax error")}
+            (recur (next opts) (assoc acc :exists :nx)))
+
+          "XX"
+          (if (:exists acc)
+            {:error (resp/error "ERR syntax error")}
+            (recur (next opts) (assoc acc :exists :xx)))
+
+          {:error (resp/error "ERR syntax error")})))))
+
 (defn- cmd-set [ctx [k v & opts]]
-  (if (seq opts)
-    (resp/error "ERR syntax error") ;; Day4で実装
-    (do
-      (db/set-value! (:db ctx) k :string v)
-      (resp/simple "OK"))))
+  (let [parsed (parse-set-options opts)]
+    (if-let [e (:error parsed)]
+      e
+      (let [{:keys [ttl exists]} parsed
+            outcome (atom nil)]
+        (db/update-entry!
+         (:db ctx) k
+         (fn [existing]
+           (cond
+             (and (= :nx exists) (some? existing))
+             (do (reset! outcome nil) existing)
+             
+             (and (= :xx exists) (nil? existing))
+             (do (reset! outcome nil) nil)
+             
+             :else
+             (do (reset! outcome (resp/simple "OK"))
+                 (cond-> (db/entry :string v)
+                   ttl (assoc :expire-at (+ (db/now) ttl)))))))
+        @outcome))))
 
 (defn- cmd-get [ctx [k]]
   (db/get-value (:db ctx) k))
@@ -88,11 +145,6 @@
 
 (defn- cmd-dbsize [ctx _args]
   (db/size (:db ctx)))
-
-(defn- parse-long-or-nil
-  [^String s]
-  (try (Long/parseLong s)
-       (catch NumberFormatException _ nil)))
 
 (defn- incr-by!
   [ctx k ^long delta]

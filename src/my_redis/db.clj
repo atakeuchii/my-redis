@@ -4,6 +4,10 @@
 (def wrong-type
   ::wrong-type)
 
+(defn now
+  []
+  (System/currentTimeMillis))
+
 (defn create 
   []
   (atom {}))
