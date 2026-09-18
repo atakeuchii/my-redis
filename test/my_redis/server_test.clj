@@ -17,7 +17,7 @@
 
 (defn- send-cmd!
   "コマンドを送って応答を読む。接続は開いたまま。"
-  [{:keys [in out]} cmd]
+  [{:keys [in ^BufferedOutputStream out]} cmd]
   (resp/write-reply! out cmd)
   (.flush out)
   (resp/read-reply in))
@@ -101,7 +101,7 @@
 (deftest inline-command-works
   (testing "型記号なしの素のテキストも受け付ける"
     (with-server [port]
-      (let [{:keys [^Socket socket in out]} (connect port)]
+      (let [{:keys [^Socket socket in ^BufferedOutputStream out]} (connect port)]
         (try
           (.write out (.getBytes "PING\r\n" "UTF-8"))
           (.flush out)
@@ -111,7 +111,7 @@
 (deftest blank-line-is-ignored
   (testing "空行を送っても接続が切れず、次のコマンドが通る"
     (with-server [port]
-      (let [{:keys [^Socket socket in out]} (connect port)]
+      (let [{:keys [^Socket socket in ^BufferedOutputStream out]} (connect port)]
         (try
           (.write out (.getBytes "\r\nPING\r\n" "UTF-8"))
           (.flush out)

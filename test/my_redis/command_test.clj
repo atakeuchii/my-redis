@@ -80,11 +80,6 @@
       (is (= "" (run c "GET" "k")))
       (is (= 1 (run c "EXISTS" "k"))))))
 
-(deftest set-rejects-options-for-now
-  (testing "EX などのオプションは Day 4 まで未対応。黙って無視せずエラーにする"
-    (is (= "ERR syntax error"
-           (err-msg (run (ctx) "SET" "k" "v" "EX" "10"))))))
-
 ;; ---------- キー全般 ----------
 
 (deftest del-counts-deleted
@@ -171,3 +166,241 @@
 
 (deftest quit-returns-keyword
   (is (= :quit (run (ctx) "QUIT"))))
+
+;; ---------- INCR 系 ----------
+
+(deftest incr-on-missing-key
+  (testing "存在しないキーは 0 として扱う"
+    (is (= 1 (run (ctx) "INCR" "fresh")))))
+
+(deftest incr-increments
+  (let [c (ctx)]
+    (run c "SET" "n" "10")
+    (is (= 11 (run c "INCR" "n")))
+    (is (= "11" (run c "GET" "n")))))
+
+(deftest decr-decrements
+  (let [c (ctx)]
+    (run c "SET" "n" "10")
+    (is (= 9 (run c "DECR" "n")))))
+
+(deftest incrby-and-decrby
+  (let [c (ctx)]
+    (run c "SET" "n" "10")
+    (is (= 15 (run c "INCRBY" "n" "5")))
+    (is (= 5 (run c "DECRBY" "n" "10")))
+    (is (= -5 (run c "DECRBY" "n" "10")))))
+
+(deftest incr-on-non-integer
+  (let [c (ctx)]
+    (run c "SET" "s" "abc")
+    (is (= "ERR value is not an integer or out of range"
+           (err-msg (run c "INCR" "s"))))
+    (testing "値が変わっていない"
+      (is (= "abc" (run c "GET" "s"))))))
+
+(deftest incrby-with-non-integer-delta
+  (is (= "ERR value is not an integer or out of range"
+         (err-msg (run (ctx) "INCRBY" "k" "abc")))))
+
+(deftest incr-overflow
+  (testing "オーバーフローは例外ではなくエラー値を返す"
+    (let [c (ctx)]
+      (run c "SET" "big" (str Long/MAX_VALUE))
+      (is (= "ERR increment or decrement would overflow"
+             (err-msg (run c "INCR" "big"))))
+      (testing "値が変わっていない"
+        (is (= (str Long/MAX_VALUE) (run c "GET" "big")))))))
+
+(deftest decr-underflow
+  (let [c (ctx)]
+    (run c "SET" "small" (str Long/MIN_VALUE))
+    (is (= "ERR increment or decrement would overflow"
+           (err-msg (run c "DECR" "small"))))))
+
+(deftest incr-is-atomic
+  (testing "並行 INCR で1つも失われない"
+    (let [c (ctx)
+          threads 50
+          per-thread 200]
+      (run c "SET" "counter" "0")
+      (->> (range threads)
+           (map (fn [_] (future (dotimes [_ per-thread]
+                                  (command/dispatch c ["INCR" "counter"])))))
+           doall
+           (run! deref))
+      (is (= (str (* threads per-thread)) (run c "GET" "counter"))))))
+
+;; ---------- APPEND / STRLEN / GETSET / SETNX ----------
+
+(deftest append-to-missing-key
+  (is (= 5 (run (ctx) "APPEND" "k" "hello"))))
+
+(deftest append-accumulates
+  (let [c (ctx)]
+    (run c "APPEND" "k" "hello")
+    (is (= 11 (run c "APPEND" "k" " world")))
+    (is (= "hello world" (run c "GET" "k")))))
+
+(deftest strlen-counts-bytes-not-chars
+  (testing "マルチバイト文字はバイト数で数える"
+    (let [c (ctx)]
+      (run c "SET" "j" "あ")
+      (is (= 3 (run c "STRLEN" "j"))))))
+
+(deftest append-returns-byte-length
+  (let [c (ctx)]
+    (is (= 3 (run c "APPEND" "j" "あ")))
+    (is (= 3 (run c "STRLEN" "j")))))
+
+(deftest strlen-on-missing-key
+  (testing "Integer を返すコマンドなので nil ではなく 0"
+    (is (= 0 (run (ctx) "STRLEN" "nope")))))
+
+(deftest getset-returns-old-value
+  (let [c (ctx)]
+    (run c "SET" "k" "old")
+    (is (= "old" (run c "GETSET" "k" "new")))
+    (is (= "new" (run c "GET" "k")))))
+
+(deftest getset-on-missing-key
+  (let [c (ctx)]
+    (is (nil? (run c "GETSET" "k" "v")))
+    (is (= "v" (run c "GET" "k")))))
+
+(deftest setnx-only-when-absent
+  (let [c (ctx)]
+    (is (= 1 (run c "SETNX" "k" "first")))
+    (is (= 0 (run c "SETNX" "k" "second")))
+    (is (= "first" (run c "GET" "k")))))
+
+;; ---------- MSET / MGET ----------
+
+(deftest mset-and-mget
+  (let [c (ctx)]
+    (run c "MSET" "a" "1" "b" "2" "c" "3")
+    (is (= ["1" "2" "3"] (run c "MGET" "a" "b" "c")))))
+
+(deftest mget-missing-keys-are-nil
+  (let [c (ctx)]
+    (run c "SET" "a" "1")
+    (is (= ["1" nil] (run c "MGET" "a" "nope")))))
+
+(deftest mset-odd-arguments
+  (is (= "ERR wrong number of arguments for 'mset' command"
+         (err-msg (run (ctx) "MSET" "a" "1" "b")))))
+
+(deftest mset-duplicate-keys-last-wins
+  (let [c (ctx)]
+    (run c "MSET" "k" "v1" "k" "v2")
+    (is (= "v2" (run c "GET" "k")))))
+
+(deftest mset-is-atomic
+  (testing "MSET の途中経過が観測されない"
+    (let [d (db/create)
+          c {:db d}
+          observed (atom #{})
+          watching (atom true)]
+      (let [watcher (future (while @watching (swap! observed conj (db/size d))))]
+        (command/dispatch c ["MSET" "a" "1" "b" "2" "c" "3" "d" "4" "e" "5"])
+        (Thread/sleep 30)
+        (reset! watching false)
+        @watcher)
+      (is (empty? (disj @observed 0 5))
+          (str "中間状態が観測された: " @observed)))))
+
+(deftest mget-reads-consistent-snapshot
+  (testing "MGET は一貫したスナップショットを読む"
+    (let [c (ctx)
+          writing (atom true)
+          mismatches (atom 0)]
+      (command/dispatch c ["MSET" "a" "0" "b" "0"])
+      (let [writer (future
+                     (loop [n 1]
+                       (when @writing
+                         (command/dispatch c ["MSET" "a" (str n) "b" (str n)])
+                         (recur (inc n)))))]
+        (dotimes [_ 5000]
+          (let [[a b] (command/dispatch c ["MGET" "a" "b"])]
+            (when (not= a b) (swap! mismatches inc))))
+        (reset! writing false)
+        @writer)
+      (is (zero? @mismatches)))))
+
+;; ---------- SET のオプション ----------
+
+(deftest set-nx-when-absent
+  (let [c (ctx)]
+    (is (= "OK" (:value (run c "SET" "k" "v" "NX"))))
+    (is (= "v" (run c "GET" "k")))))
+
+(deftest set-nx-when-present-returns-nil
+  (testing "セットされなかった場合は Null Bulk String"
+    (let [c (ctx)]
+      (run c "SET" "k" "first")
+      (is (nil? (run c "SET" "k" "second" "NX")))
+      (is (= "first" (run c "GET" "k"))))))
+
+(deftest set-xx-when-present
+  (let [c (ctx)]
+    (run c "SET" "k" "first")
+    (is (= "OK" (:value (run c "SET" "k" "second" "XX"))))
+    (is (= "second" (run c "GET" "k")))))
+
+(deftest set-xx-when-absent-returns-nil
+  (let [c (ctx)]
+    (is (nil? (run c "SET" "k" "v" "XX")))
+    (is (= 0 (run c "EXISTS" "k")))))
+
+(deftest set-stores-expire-at
+  (testing "EX は絶対時刻に変換して保存される（まだ期限切れはしない）"
+    (let [d (db/create)
+          c {:db d}
+          before (db/now)]
+      (run c "SET" "k" "v" "EX" "10")
+      (let [e (db/get-entry d "k")
+            exp (:expire-at e)]
+        (is (some? exp))
+        (is (<= (+ before 10000) exp (+ before 10000 1000)))))))
+
+(deftest set-px-uses-milliseconds
+  (let [d (db/create)
+        c {:db d}
+        before (db/now)]
+    (run c "SET" "k" "v" "PX" "5000")
+    (is (<= (+ before 5000) (:expire-at (db/get-entry d "k")) (+ before 5000 1000)))))
+
+(deftest set-option-syntax-errors
+  (let [c (ctx)]
+    (is (= "ERR syntax error" (err-msg (run c "SET" "k" "v" "NX" "XX"))))
+    (is (= "ERR syntax error" (err-msg (run c "SET" "k" "v" "EX" "10" "PX" "5000"))))
+    (is (= "ERR syntax error" (err-msg (run c "SET" "k" "v" "FOO"))))
+    (is (= "ERR syntax error" (err-msg (run c "SET" "k" "v" "EX"))))))
+
+(deftest set-invalid-expire
+  (let [c (ctx)]
+    (is (= "ERR value is not an integer or out of range"
+           (err-msg (run c "SET" "k" "v" "EX" "abc"))))
+    (is (= "ERR invalid expire time in 'set' command"
+           (err-msg (run c "SET" "k" "v" "EX" "0"))))))
+
+(deftest set-options-are-case-insensitive
+  (let [c (ctx)]
+    (is (= "OK" (:value (run c "SET" "k" "v" "nx"))))
+    (is (nil? (run c "SET" "k" "v2" "nx")))))
+
+(deftest set-nx-with-ex
+  (let [d (db/create)
+        c {:db d}]
+    (run c "SET" "k" "v" "NX" "EX" "10")
+    (is (some? (:expire-at (db/get-entry d "k"))))))
+
+;; ---------- ハンドラの例外が接続を落とさない ----------
+
+(deftest handler-exception-becomes-error
+  (testing "ハンドラが例外を投げてもエラー値に変換される"
+    (with-redefs [command/command-table
+                  (assoc command/command-table
+                         "BOOM" {:arity 1 :write? false
+                                 :handler (fn [_ _] (throw (RuntimeException. "boom")))})]
+      (is (= "ERR internal error" (err-msg (run (ctx) "BOOM")))))))
