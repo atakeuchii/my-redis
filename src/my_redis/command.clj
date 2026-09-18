@@ -9,6 +9,18 @@
 ;;   args = コマンド名を除いた引数のベクタ
 ;; ソケットには触らない。返り値だけで応答を表す。
 
+(def ^:private wrong-type-error
+  (resp/error "WRONGTYPE Operation against a key holding the wrong kind of value"))
+
+(def ^:private not-integer-error
+  (resp/error "ERR value is not an integer or out of range"))
+
+(def ^:private overflow-error
+  (resp/error "ERR increment or decrement would overflow"))
+
+(defn- byte-length ^long [^String s]
+  (alength (.getBytes s "UTF-8")))
+
 (defn- cmd-ping [_ctx args]
   (if (seq args)
     (first args)
@@ -77,6 +89,93 @@
 (defn- cmd-dbsize [ctx _args]
   (db/size (:db ctx)))
 
+(defn- parse-long-or-nil
+  [^String s]
+  (try (Long/parseLong s)
+       (catch NumberFormatException _ nil)))
+
+(defn- incr-by!
+  [ctx k ^long delta]
+  (let [d (:db ctx)
+        outcome (atom nil)]
+    (db/update-entry!
+     d k
+     (fn [e]
+       (cond
+         (and (some? e) (not= :string (:type e)))
+         (do (reset! outcome wrong-type-error)
+             e)
+
+         :else
+         (let [n (parse-long-or-nil (if e (:value e) "0"))]
+           (cond
+             (nil? n)
+             (do (reset! outcome not-integer-error)
+                 e)
+
+             (or (and (pos? delta) (> n (- Long/MAX_VALUE delta)))
+                 (and (neg? delta) (< n (- Long/MIN_VALUE delta))))
+             (do (reset! outcome overflow-error) e)
+
+             :else
+             (let [next (+ n delta)]
+               (reset! outcome next)
+               (db/entry :string (str next))))))))
+    @outcome))
+
+(defn- cmd-incr [ctx [k]] (incr-by! ctx k 1))
+(defn- cmd-decr [ctx [k]] (incr-by! ctx k -1))
+
+(defn- cmd-incrby [ctx [k delta]]
+  (if-let [n (parse-long-or-nil delta)]
+    (incr-by! ctx k n)
+    not-integer-error))
+
+(defn- cmd-decrby [ctx [k delta]]
+  (if-let [n (parse-long-or-nil delta)]
+    (incr-by! ctx k (- n))
+    not-integer-error))
+
+(defn- cmd-strlen [ctx [k]]
+  (let [v (db/typed-value (:db ctx) k :string "")]
+    (if (db/wrong-type? v)
+      wrong-type-error
+      (byte-length v))))
+
+(defn- cmd-append [ctx [k suffix]]
+  (let [outcome (atom nil)]
+    (db/update-entry!
+     (:db ctx) k
+     (fn [e]
+       (if (and (some? e) (not= :string (:type e)))
+         (do (reset! outcome wrong-type-error) e)
+         (let [next (str (if e (:value e) "") suffix)]
+           (reset! outcome (byte-length next))
+           (db/entry :string next)))))
+    @outcome))
+
+(defn- cmd-getset [ctx [k v]]
+  (let [outcome (atom nil)]
+    (db/update-entry!
+     (:db ctx) k
+     (fn [e]
+       (if (and (some? e) (not= :string (:type e)))
+         (do (reset! outcome wrong-type-error) e)
+         (do (reset! outcome (:value e))
+             (db/entry :string v)))))
+    @outcome))
+
+(defn- cmd-setnx [ctx [k v]]
+  (let [outcome (atom nil)]
+    (db/update-entry!
+     (:db ctx) k
+     (fn [e]
+       (if (some? e)
+         (do (reset! outcome 0) e)
+         (do (reset! outcome 1)
+             (db/entry :string v)))))
+    @outcome))
+
 (def command-table
   {"PING"    {:arity -1 :write? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :handler cmd-echo}
@@ -90,7 +189,17 @@
    "TYPE"    {:arity  2 :write? false :handler cmd-type}
    "KEYS"    {:arity  2 :write? false :handler cmd-keys}
    "FLUSHDB" {:arity -1 :write? true  :handler cmd-flushdb}
-   "DBSIZE"  {:arity  1 :write? false :handler cmd-dbsize}})
+
+   "DBSIZE"  {:arity  1 :write? false :handler cmd-dbsize}
+   "INCR"    {:arity  2 :write? true  :handler cmd-incr}
+   "DECR"    {:arity  2 :write? true  :handler cmd-decr}
+   "INCRBY"  {:arity  3 :write? true  :handler cmd-incrby}
+   "DECRBY"  {:arity  3 :write? true  :handler cmd-decrby}
+   
+   "APPEND" {:arity 3 :write? true  :handler cmd-append}
+   "STRLEN" {:arity 2 :write? false :handler cmd-strlen}
+   "GETSET" {:arity 3 :write? true  :handler cmd-getset}
+   "SETNX"  {:arity 3 :write? true  :handler cmd-setnx}})
 
 (defn- arity-ok?
   [^long arity ^long n]
@@ -108,9 +217,13 @@
       (cond
         (nil? spec)
         (resp/error (str "ERR unknown command '" raw "'"))
-        
+
         (not (arity-ok? (:arity spec) (count cmd)))
         (resp/error (str "ERR wrong number of arguments for '" (str/lower-case name) "' command"))
-        
+
         :else
-        ((:handler spec) ctx (vec (rest cmd)))))))
+        (try
+          ((:handler spec) ctx (vec (rest cmd)))
+          (catch Exception e
+            (println "[command] error in" name ":" (.getMessage e))
+            (resp/error "ERR internal error")))))))
