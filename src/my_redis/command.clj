@@ -176,6 +176,23 @@
              (db/entry :string v)))))
     @outcome))
 
+(defn- cmd-mset [ctx args]
+  (if (odd? (count args))
+    (resp/error "ERR wrong number of arguments for 'mset' command")
+    (let [pairs (partition 2 args)]
+      (db/set-entries! (:db ctx)
+                       (into {}
+                             (map (fn [[k v]] [k (db/entry :string v)]) pairs)))
+      (resp/simple "OK"))))
+
+(defn- cmd-mget [ctx args]
+  (let [snap (db/snapshot (:db ctx))]
+    (mapv (fn [k]
+            (let [e (db/entry-in snap k)]
+              (when (= :string (:type e))
+                (:value e))))
+          args)))
+
 (def command-table
   {"PING"    {:arity -1 :write? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :handler cmd-echo}
@@ -199,7 +216,9 @@
    "APPEND" {:arity 3 :write? true  :handler cmd-append}
    "STRLEN" {:arity 2 :write? false :handler cmd-strlen}
    "GETSET" {:arity 3 :write? true  :handler cmd-getset}
-   "SETNX"  {:arity 3 :write? true  :handler cmd-setnx}})
+   "SETNX"  {:arity 3 :write? true  :handler cmd-setnx}
+   "MSET"   {:arity -3 :write? true  :handler cmd-mset}
+   "MGET"   {:arity -2 :write? false :handler cmd-mget}})
 
 (defn- arity-ok?
   [^long arity ^long n]

@@ -46,6 +46,19 @@
   (set-entry! db k (entry type value))
   nil)
 
+(defn set-entries!
+  [db entries]
+  (swap! db merge entries)
+  nil)
+
+(defn snapshot
+  [db]
+  @db)
+
+(defn entry-in
+  [snapshot k]
+  (get snapshot k))
+
 (defn delete!
   [db k]
   (let [[old _] (swap-vals! db dissoc k)]
