@@ -1,6 +1,13 @@
 (ns my-redis.db
   (:refer-clojure :exclude [keys]))
 
+(def wrong-type
+  ::wrong-type)
+
+(defn now
+  []
+  (System/currentTimeMillis))
+
 (defn create 
   []
   (atom {}))
@@ -43,6 +50,19 @@
   (set-entry! db k (entry type value))
   nil)
 
+(defn set-entries!
+  [db entries]
+  (swap! db merge entries)
+  nil)
+
+(defn snapshot
+  [db]
+  @db)
+
+(defn entry-in
+  [snapshot k]
+  (get snapshot k))
+
 (defn delete!
   [db k]
   (let [[old _] (swap-vals! db dissoc k)]
@@ -58,6 +78,26 @@
   [db]
   (reset! db {})
   nil)
+
+(defn wrong-type?
+  [x]
+  (= x wrong-type))
+
+(defn fetch-typed
+  [db k type]
+  (let [e (get-entry db k)]
+    (cond
+      (nil? e) nil
+      (= type (:type e)) e
+      :else wrong-type)))
+
+(defn typed-value
+  [db k type default]
+  (let [e (fetch-typed db k type)]
+    (cond 
+      (wrong-type? e) wrong-type
+      (nil? e) default
+      :else (:value e))))
 
 (defn update-entry!
   [db k f]
