@@ -4,7 +4,6 @@
 
 (def ^:private CR (int \return))
 (def ^:private LF (int \newline))
-;; (def ^:private ^bytes CRLF (.getBytes "\r\n" "UTF-8"))
 (def ^:private ^"[B" CRLF (.getBytes "\r\n" "UTF-8"))
 
 (defrecord RespError [^String message])

@@ -1,6 +1,9 @@
 (ns my-redis.db
   (:refer-clojure :exclude [keys]))
 
+(def wrong-type
+  ::wrong-type)
+
 (defn create 
   []
   (atom {}))
@@ -58,6 +61,26 @@
   [db]
   (reset! db {})
   nil)
+
+(defn wrong-type?
+  [x]
+  (= x wrong-type))
+
+(defn fetch-typed
+  [db k type]
+  (let [e (get-entry db k)]
+    (cond
+      (nil? e) nil
+      (= type (:type e)) e
+      :else wrong-type)))
+
+(defn typed-value
+  [db k type default]
+  (let [e (fetch-typed db k type)]
+    (cond 
+      (wrong-type? e) wrong-type
+      (nil? e) default
+      :else (:value e))))
 
 (defn update-entry!
   [db k f]
