@@ -404,3 +404,248 @@
                          "BOOM" {:arity 1 :write? false
                                  :handler (fn [_ _] (throw (RuntimeException. "boom")))})]
       (is (= "ERR internal error" (err-msg (run (ctx) "BOOM")))))))
+
+;; ---------- List: 基本 ----------
+
+(deftest rpush-appends-in-order
+  (let [c (ctx)]
+    (is (= 3 (run c "RPUSH" "l" "a" "b" "c")))
+    (is (= ["a" "b" "c"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest lpush-reverses-argument-order
+  (testing "LPUSH は引数を順に先頭へ押し込むので逆順になる"
+    (let [c (ctx)]
+      (is (= 3 (run c "LPUSH" "l" "a" "b" "c")))
+      (is (= ["c" "b" "a"] (run c "LRANGE" "l" "0" "-1"))))))
+
+(deftest push-returns-length-after
+  (let [c (ctx)]
+    (is (= 1 (run c "RPUSH" "l" "a")))
+    (is (= 3 (run c "RPUSH" "l" "b" "c")))
+    (is (= 4 (run c "LPUSH" "l" "z")))))
+
+(deftest llen-counts
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c")
+    (is (= 3 (run c "LLEN" "l")))))
+
+;; ---------- List: 不在キー ----------
+
+(deftest list-commands-on-missing-key
+  (testing "返り値の型が不在時の挙動を決める"
+    (let [c (ctx)]
+      (is (= 0 (run c "LLEN" "nokey")))
+      (is (= [] (run c "LRANGE" "nokey" "0" "-1")))
+      (is (nil? (run c "LPOP" "nokey")))
+      (is (nil? (run c "RPOP" "nokey")))
+      (is (nil? (run c "LINDEX" "nokey" "0"))))))
+
+(deftest pop-on-missing-key-does-not-create-it
+  (let [c (ctx)]
+    (run c "LPOP" "nokey")
+    (is (= 0 (run c "EXISTS" "nokey")))))
+
+;; ---------- List: 両端操作 ----------
+
+(deftest pop-from-both-ends
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c")
+    (is (= "a" (run c "LPOP" "l")))
+    (is (= "c" (run c "RPOP" "l")))
+    (is (= ["b"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest alternating-pops-across-rebalance
+  (testing "front/back のリバランスを跨いでも順序が保たれる"
+    (let [c (ctx)]
+      (run c "RPUSH" "q" "1" "2" "3" "4" "5" "6")
+      (is (= "1" (run c "LPOP" "q")))
+      (is (= "6" (run c "RPOP" "q")))
+      (is (= "2" (run c "LPOP" "q")))
+      (is (= "5" (run c "RPOP" "q")))
+      (is (= ["3" "4"] (run c "LRANGE" "q" "0" "-1"))))))
+
+(deftest drain-from-left
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c" "d" "e")
+    (is (= ["a" "b" "c" "d" "e"]
+           (mapv (fn [_] (run c "LPOP" "l")) (range 5))))
+    (is (= 0 (run c "EXISTS" "l")))))
+
+(deftest drain-from-right
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c" "d" "e")
+    (is (= ["e" "d" "c" "b" "a"]
+           (mapv (fn [_] (run c "RPOP" "l")) (range 5))))
+    (is (= 0 (run c "EXISTS" "l")))))
+
+(deftest push-after-drain
+  (testing "空になって消えたキーに再度 push できる"
+    (let [c (ctx)]
+      (run c "RPUSH" "l" "a")
+      (run c "LPOP" "l")
+      (is (= 1 (run c "RPUSH" "l" "new")))
+      (is (= ["new"] (run c "LRANGE" "l" "0" "-1"))))))
+
+(deftest empty-list-deletes-key
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "only")
+    (run c "LPOP" "l")
+    (is (= 0 (run c "EXISTS" "l")))
+    (is (= "none" (:value (run c "TYPE" "l"))))))
+
+;; ---------- List: LRANGE の境界 ----------
+
+(deftest lrange-negative-indices
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c" "d" "e")
+    (is (= ["d" "e"] (run c "LRANGE" "l" "-2" "-1")))
+    (is (= ["a" "b" "c" "d" "e"] (run c "LRANGE" "l" "0" "-1")))
+    (is (= ["c"] (run c "LRANGE" "l" "-3" "-3")))))
+
+(deftest lrange-clamps-out-of-range
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c")
+    (testing "上限を超えてもエラーにならずクランプされる"
+      (is (= ["a" "b" "c"] (run c "LRANGE" "l" "0" "999"))))
+    (testing "下限を下回ってもクランプされる"
+      (is (= ["a" "b" "c"] (run c "LRANGE" "l" "-999" "999"))))
+    (testing "範囲が全く重ならなければ空"
+      (is (= [] (run c "LRANGE" "l" "10" "20"))))
+    (testing "start > stop なら空"
+      (is (= [] (run c "LRANGE" "l" "2" "1"))))))
+
+(deftest lrange-single-element
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c")
+    (is (= ["b"] (run c "LRANGE" "l" "1" "1")))))
+
+(deftest lrange-non-integer-index
+  (is (= "ERR value is not an integer or out of range"
+         (err-msg (run (ctx) "LRANGE" "l" "a" "b")))))
+
+;; ---------- List: LINDEX / LSET ----------
+
+(deftest lindex-positive-and-negative
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c")
+    (is (= "a" (run c "LINDEX" "l" "0")))
+    (is (= "c" (run c "LINDEX" "l" "2")))
+    (is (= "c" (run c "LINDEX" "l" "-1")))
+    (is (= "a" (run c "LINDEX" "l" "-3")))))
+
+(deftest lindex-out-of-range-is-nil
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c")
+    (is (nil? (run c "LINDEX" "l" "3")))
+    (is (nil? (run c "LINDEX" "l" "-4")))))
+
+(deftest lindex-after-rebalance
+  (testing "リバランス後もインデックスが正しい"
+    (let [c (ctx)]
+      (run c "RPUSH" "l" "a" "b" "c" "d" "e" "f")
+      (run c "LPOP" "l")
+      (is (= "b" (run c "LINDEX" "l" "0")))
+      (is (= "f" (run c "LINDEX" "l" "-1")))
+      (is (= "d" (run c "LINDEX" "l" "2"))))))
+
+(deftest lset-replaces-element
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c")
+    (is (= "OK" (:value (run c "LSET" "l" "1" "X"))))
+    (is (= ["a" "X" "c"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest lset-negative-index
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c")
+    (run c "LSET" "l" "-1" "Z")
+    (is (= ["a" "b" "Z"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest lset-out-of-range
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a")
+    (is (= "ERR index out of range" (err-msg (run c "LSET" "l" "5" "x"))))))
+
+(deftest lset-on-missing-key
+  (is (= "ERR no such key" (err-msg (run (ctx) "LSET" "nokey" "0" "x")))))
+
+;; ---------- 型チェック ----------
+
+(deftest wrong-type-string-command-on-list
+  (testing "List に String コマンドを打つと WRONGTYPE"
+    (let [c (ctx)
+          expected "WRONGTYPE Operation against a key holding the wrong kind of value"]
+      (run c "RPUSH" "l" "a")
+      (is (= expected (err-msg (run c "GET" "l"))))
+      (is (= expected (err-msg (run c "APPEND" "l" "x"))))
+      (is (= expected (err-msg (run c "STRLEN" "l"))))
+      (is (= expected (err-msg (run c "INCR" "l"))))
+      (is (= expected (err-msg (run c "GETSET" "l" "x")))))))
+
+(deftest wrong-type-list-command-on-string
+  (testing "String に List コマンドを打つと WRONGTYPE"
+    (let [c (ctx)
+          expected "WRONGTYPE Operation against a key holding the wrong kind of value"]
+      (run c "SET" "s" "v")
+      (is (= expected (err-msg (run c "RPUSH" "s" "x"))))
+      (is (= expected (err-msg (run c "LPUSH" "s" "x"))))
+      (is (= expected (err-msg (run c "LPOP" "s"))))
+      (is (= expected (err-msg (run c "RPOP" "s"))))
+      (is (= expected (err-msg (run c "LLEN" "s"))))
+      (is (= expected (err-msg (run c "LRANGE" "s" "0" "-1"))))
+      (is (= expected (err-msg (run c "LINDEX" "s" "0"))))
+      (is (= expected (err-msg (run c "LSET" "s" "0" "x")))))))
+
+(deftest type-agnostic-commands-work-on-list
+  (testing "中身を見ないコマンドは型を問わない"
+    (let [c (ctx)]
+      (run c "RPUSH" "l" "a")
+      (is (= 1 (run c "EXISTS" "l")))
+      (is (= "list" (:value (run c "TYPE" "l"))))
+      (is (= 0 (run c "SETNX" "l" "x")))
+      (is (= 1 (run c "DEL" "l"))))))
+
+(deftest mget-returns-nil-for-wrong-type
+  (testing "MGET は型違いでもエラーにせず nil を返す"
+    (let [c (ctx)]
+      (run c "SET" "s" "v")
+      (run c "RPUSH" "l" "a")
+      (is (= ["v" nil] (run c "MGET" "s" "l"))))))
+
+(deftest set-overwrites-list
+  (testing "SET は型を問わず上書きする"
+    (let [c (ctx)]
+      (run c "RPUSH" "l" "a")
+      (is (= "OK" (:value (run c "SET" "l" "now-a-string"))))
+      (is (= "string" (:value (run c "TYPE" "l")))))))
+
+;; ---------- 並行性 ----------
+
+(deftest concurrent-push-loses-nothing
+  (testing "並行 RPUSH で要素が失われない"
+    (let [c (ctx)
+          threads 20
+          per-thread 100]
+      (->> (range threads)
+           (map (fn [t]
+                  (future (dotimes [i per-thread]
+                            (command/dispatch c ["RPUSH" "l" (str t "-" i)])))))
+           doall
+           (run! deref))
+      (is (= (* threads per-thread) (run c "LLEN" "l"))))))
+
+(deftest concurrent-pop-does-not-duplicate
+  (testing "並行 LPOP で同じ要素が2回取れない"
+    (let [c (ctx)
+          n 2000]
+      (dotimes [i n] (command/dispatch c ["RPUSH" "l" (str i)]))
+      (let [results (->> (range 20)
+                         (map (fn [_]
+                                (future
+                                  (loop [acc []]
+                                    (if-let [v (command/dispatch c ["LPOP" "l"])]
+                                      (recur (conj acc v))
+                                      acc)))))
+                         doall
+                         (mapcat deref))]
+        (is (= n (count results)))
+        (is (= n (count (set results))) "重複した要素がある")))))
