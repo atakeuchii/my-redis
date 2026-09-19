@@ -1,7 +1,8 @@
 (ns my-redis.command
   (:require [clojure.string :as str]
             [my-redis.resp :as resp]
-            [my-redis.db :as db]))
+            [my-redis.db :as db]
+            [my-redis.types.list :as dlist]))
 
 ;; ---------- ハンドラ ----------
 ;; シグネチャ: (fn [ctx args] -> reply)
@@ -100,7 +101,10 @@
         @outcome))))
 
 (defn- cmd-get [ctx [k]]
-  (db/get-value (:db ctx) k))
+  (let [v (db/typed-value (:db ctx) k :string nil)]
+    (if (db/wrong-type? v)
+      wrong-type-error
+      (db/get-value (:db ctx) k))))
 
 (defn- cmd-del [ctx args]
   (db/delete-many! (:db ctx) args))
@@ -245,6 +249,102 @@
                 (:value e))))
           args)))
 
+(defn- list-update!
+  "リストを更新する共通処理。f は現在のベクタ(無ければ [])を受け取り、
+   [新しいベクタ 返り値] を返す。新しいベクタが空ならキーごと削除する。"
+  [ctx k f]
+  (let [outcome (atom nil)]
+    (db/update-entry!
+     (:db ctx) k
+     (fn [e]
+       (if (and (some? e) (not= :list (:type e)))
+         (do (reset! outcome wrong-type-error) e)
+         (let [current (if e (:value e) dlist/empty-list)
+               [next ret] (f current)]
+           (reset! outcome ret)
+           (when-not (dlist/empty? next)
+             (db/entry :list next))))))
+    @outcome))
+
+(defn- list-read
+  "リストを読む共通処理。f は現在のベクタ(無ければ [])を受け取り、返り値を返す。"
+  [ctx k f]
+  (let [v (db/typed-value (:db ctx) k :list dlist/empty-list)]
+    (if (db/wrong-type? v)
+      wrong-type-error
+      (f v))))
+
+(defn- normalize-index
+  ^long [^long i ^long len]
+  (if (neg? i) (+ len i) i))
+
+(defn- clamp-range
+  [^long start ^long stop ^long len]
+  (let [s (max 0 (normalize-index start len))
+        e (min (dec len) (normalize-index stop len))]
+    (when (and (<= s e) (< s len))
+      [s e])))
+
+(defn- cmd-rpush [ctx [k & vs]]
+  (list-update! ctx k (fn [l]
+                        (let [next (reduce dlist/push-right l vs)]
+                          [next (dlist/count next)]))))
+
+(defn- cmd-lpush [ctx [k & vs]]
+  (list-update! ctx k (fn [l]
+                        (let [next (reduce dlist/push-left l vs)]
+                          [next (dlist/count next)]))))
+
+(defn- cmd-rpop [ctx [k]]
+  (list-update! ctx k (fn [l]
+                        (if (dlist/empty? l)
+                          [l nil]
+                          [(dlist/pop-right l) (dlist/peek-right l)]))))
+
+(defn- cmd-lpop [ctx [k]]
+  (list-update! ctx k (fn [l]
+                        (if (dlist/empty? l)
+                          [l nil]
+                          [(dlist/pop-left l) (dlist/peek-left l)]))))
+
+(defn- cmd-llen [ctx [k]]
+  (list-read ctx k dlist/count))
+
+(defn- cmd-lrange [ctx [k start stop]]
+  (let [s (parse-long-or-nil start)
+        e (parse-long-or-nil stop)]
+    (if (or (nil? s) (nil? e))
+      not-integer-error
+      (list-read ctx k
+                 (fn [l]
+                   (if-let [[from to] (clamp-range s e (dlist/count l))]
+                     (dlist/subrange l from to)
+                     []))))))
+
+(defn- cmd-lindex [ctx [k i]]
+  (if-let [n (parse-long-or-nil i)]
+    (list-read ctx k
+               (fn [l]
+                 (dlist/nth l (normalize-index n (dlist/count l)))))
+    not-integer-error))
+
+(defn- cmd-lset [ctx [k i v]]
+  (if-let [n (parse-long-or-nil i)]
+    (list-update! ctx k
+                  (fn [l]
+                    (let [len (dlist/count l)
+                          idx (normalize-index n len)]
+                      (cond
+                        (zero? len)
+                        [l (resp/error "ERR no such key")]
+
+                        (or (neg? idx) (>= idx len))
+                        [l (resp/error "ERR index out of range")]
+
+                        :else
+                        [(dlist/assoc-nth l idx v) (resp/simple "OK")]))))
+    not-integer-error))
+
 (def command-table
   {"PING"    {:arity -1 :write? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :handler cmd-echo}
@@ -270,7 +370,16 @@
    "GETSET" {:arity 3 :write? true  :handler cmd-getset}
    "SETNX"  {:arity 3 :write? true  :handler cmd-setnx}
    "MSET"   {:arity -3 :write? true  :handler cmd-mset}
-   "MGET"   {:arity -2 :write? false :handler cmd-mget}})
+   "MGET"   {:arity -2 :write? false :handler cmd-mget}
+   
+   "RPUSH"  {:arity -3 :write? true  :handler cmd-rpush}
+   "LPUSH"  {:arity -3 :write? true  :handler cmd-lpush}
+   "RPOP"   {:arity  2 :write? true  :handler cmd-rpop}
+   "LPOP"   {:arity  2 :write? true  :handler cmd-lpop}
+   "LLEN"   {:arity  2 :write? false :handler cmd-llen}
+   "LRANGE" {:arity  4 :write? false :handler cmd-lrange}
+   "LINDEX" {:arity  3 :write? false :handler cmd-lindex}
+   "LSET"   {:arity  4 :write? true  :handler cmd-lset}})
 
 (defn- arity-ok?
   [^long arity ^long n]
