@@ -649,3 +649,311 @@
                          (mapcat deref))]
         (is (= n (count results)))
         (is (= n (count (set results))) "重複した要素がある")))))
+
+;; ---------- Hash ----------
+
+(deftest hset-counts-new-fields-only
+  (let [c (ctx)]
+    (is (= 2 (run c "HSET" "h" "a" "1" "b" "2")))
+    (testing "上書きは新規ではないので 0"
+      (is (= 0 (run c "HSET" "h" "a" "9"))))
+    (testing "新規と上書きが混在"
+      (is (= 1 (run c "HSET" "h" "a" "8" "c" "3"))))))
+
+(deftest hget-and-hgetall
+  (let [c (ctx)]
+    (run c "HSET" "h" "name" "Aki" "age" "30")
+    (is (= "Aki" (run c "HGET" "h" "name")))
+    (is (nil? (run c "HGET" "h" "nofield")))
+    (testing "HGETALL はフラットな配列（順序は保証しない）"
+      (is (= #{["name" "Aki"] ["age" "30"]}
+             (set (partition 2 (run c "HGETALL" "h"))))))))
+
+(deftest hkeys-hvals-hlen-hexists
+  (let [c (ctx)]
+    (run c "HSET" "h" "a" "1" "b" "2")
+    (is (= #{"a" "b"} (set (run c "HKEYS" "h"))))
+    (is (= #{"1" "2"} (set (run c "HVALS" "h"))))
+    (is (= 2 (run c "HLEN" "h")))
+    (is (= 1 (run c "HEXISTS" "h" "a")))
+    (is (= 0 (run c "HEXISTS" "h" "nofield")))))
+
+(deftest hdel-counts-removed
+  (let [c (ctx)]
+    (run c "HSET" "h" "a" "1" "b" "2")
+    (is (= 2 (run c "HDEL" "h" "a" "b" "nofield")))))
+
+(deftest hdel-duplicate-fields
+  (testing "同じフィールドを複数回指定しても1回だけ数える"
+    (let [c (ctx)]
+      (run c "HSET" "h" "f" "v")
+      (is (= 1 (run c "HDEL" "h" "f" "f" "f"))))))
+
+(deftest hash-commands-on-missing-key
+  (let [c (ctx)]
+    (is (= [] (run c "HGETALL" "nokey")))
+    (is (= [] (run c "HKEYS" "nokey")))
+    (is (= 0 (run c "HLEN" "nokey")))
+    (is (nil? (run c "HGET" "nokey" "f")))
+    (is (= 0 (run c "HEXISTS" "nokey" "f")))))
+
+(deftest empty-hash-deletes-key
+  (let [c (ctx)]
+    (run c "HSET" "h" "f" "v")
+    (run c "HDEL" "h" "f")
+    (is (= 0 (run c "EXISTS" "h")))))
+
+(deftest hincrby-increments
+  (let [c (ctx)]
+    (run c "HSET" "h" "n" "10")
+    (is (= 15 (run c "HINCRBY" "h" "n" "5")))
+    (is (= 5 (run c "HINCRBY" "h" "n" "-10")))))
+
+(deftest hincrby-on-missing-field
+  (is (= 10 (run (ctx) "HINCRBY" "h" "fresh" "10"))))
+
+(deftest hincrby-on-non-integer
+  (let [c (ctx)]
+    (run c "HSET" "h" "s" "abc")
+    (is (= "ERR hash value is not an integer" (err-msg (run c "HINCRBY" "h" "s" "1"))))
+    (is (= "abc" (run c "HGET" "h" "s")))))
+
+(deftest hincrby-overflow
+  (let [c (ctx)]
+    (run c "HSET" "h" "big" (str Long/MAX_VALUE))
+    (is (= "ERR increment or decrement would overflow"
+           (err-msg (run c "HINCRBY" "h" "big" "1"))))))
+
+(deftest hset-odd-arguments
+  (is (= "ERR wrong number of arguments for 'hset' command"
+         (err-msg (run (ctx) "HSET" "h" "a" "1" "b")))))
+
+;; ---------- Set ----------
+
+(deftest sadd-counts-new-members-only
+  (let [c (ctx)]
+    (is (= 3 (run c "SADD" "s" "a" "b" "c")))
+    (is (= 1 (run c "SADD" "s" "a" "d")))
+    (is (= 0 (run c "SADD" "s" "a")))))
+
+(deftest sadd-duplicate-arguments
+  (testing "同じメンバーを複数回指定しても1回だけ数える"
+    (is (= 1 (run (ctx) "SADD" "s" "x" "x" "x")))))
+
+(deftest smembers-and-scard
+  (let [c (ctx)]
+    (run c "SADD" "s" "a" "b" "c")
+    (is (= #{"a" "b" "c"} (set (run c "SMEMBERS" "s"))))
+    (is (= 3 (run c "SCARD" "s")))))
+
+(deftest sismember
+  (let [c (ctx)]
+    (run c "SADD" "s" "a")
+    (is (= 1 (run c "SISMEMBER" "s" "a")))
+    (is (= 0 (run c "SISMEMBER" "s" "nope")))
+    (is (= 0 (run c "SISMEMBER" "nokey" "a")))))
+
+(deftest srem-counts-removed
+  (let [c (ctx)]
+    (run c "SADD" "s" "a" "b" "c")
+    (is (= 2 (run c "SREM" "s" "a" "b" "nope")))
+    (is (= #{"c"} (set (run c "SMEMBERS" "s"))))))
+
+(deftest set-commands-on-missing-key
+  (let [c (ctx)]
+    (is (= [] (run c "SMEMBERS" "nokey")))
+    (is (= 0 (run c "SCARD" "nokey")))
+    (is (nil? (run c "SPOP" "nokey")))))
+
+(deftest empty-set-deletes-key
+  (let [c (ctx)]
+    (run c "SADD" "s" "only")
+    (run c "SREM" "s" "only")
+    (is (= 0 (run c "EXISTS" "s")))))
+
+(deftest spop-removes-and-returns
+  (let [c (ctx)]
+    (run c "SADD" "s" "a" "b" "c")
+    (let [popped (run c "SPOP" "s")]
+      (is (contains? #{"a" "b" "c"} popped))
+      (is (= 2 (run c "SCARD" "s")))
+      (is (not (contains? (set (run c "SMEMBERS" "s")) popped))))))
+
+(deftest spop-drains-to-empty
+  (let [c (ctx)]
+    (run c "SADD" "s" "a" "b")
+    (run c "SPOP" "s")
+    (run c "SPOP" "s")
+    (is (= 0 (run c "EXISTS" "s")))))
+
+;; ---------- 集合演算 ----------
+
+(deftest sinter-basic
+  (let [c (ctx)]
+    (run c "SADD" "s1" "a" "b" "c")
+    (run c "SADD" "s2" "b" "c" "d")
+    (is (= #{"b" "c"} (set (run c "SINTER" "s1" "s2"))))))
+
+(deftest sinter-argument-order-does-not-matter
+  (let [c (ctx)]
+    (run c "SADD" "s1" "a" "b" "c")
+    (run c "SADD" "s2" "b" "c" "d")
+    (is (= (set (run c "SINTER" "s1" "s2"))
+           (set (run c "SINTER" "s2" "s1"))))))
+
+(deftest sinter-three-sets
+  (let [c (ctx)]
+    (run c "SADD" "s1" "a" "b" "c")
+    (run c "SADD" "s2" "b" "c" "d")
+    (run c "SADD" "s3" "c" "d" "e")
+    (is (= #{"c"} (set (run c "SINTER" "s1" "s2" "s3"))))))
+
+(deftest sinter-with-missing-key-is-empty
+  (testing "不在キーは空集合なので積は空"
+    (let [c (ctx)]
+      (run c "SADD" "s1" "a" "b")
+      (is (= [] (run c "SINTER" "s1" "nokey"))))))
+
+(deftest sinter-disjoint-sets
+  (let [c (ctx)]
+    (run c "SADD" "s1" "a")
+    (run c "SADD" "s2" "b")
+    (is (= [] (run c "SINTER" "s1" "s2")))))
+
+(deftest sunion-basic
+  (let [c (ctx)]
+    (run c "SADD" "s1" "a" "b")
+    (run c "SADD" "s2" "b" "c")
+    (is (= #{"a" "b" "c"} (set (run c "SUNION" "s1" "s2"))))))
+
+(deftest sunion-with-missing-key
+  (let [c (ctx)]
+    (run c "SADD" "s1" "a" "b")
+    (is (= #{"a" "b"} (set (run c "SUNION" "s1" "nokey"))))))
+
+(deftest sdiff-is-order-sensitive
+  (testing "SDIFF は引数の順序で結果が変わる"
+    (let [c (ctx)]
+      (run c "SADD" "s1" "a" "b" "c")
+      (run c "SADD" "s2" "b" "c" "d")
+      (is (= #{"a"} (set (run c "SDIFF" "s1" "s2"))))
+      (is (= #{"d"} (set (run c "SDIFF" "s2" "s1")))))))
+
+(deftest sdiff-with-missing-key
+  (let [c (ctx)]
+    (run c "SADD" "s1" "a" "b")
+    (is (= #{"a" "b"} (set (run c "SDIFF" "s1" "nokey"))))
+    (is (= [] (run c "SDIFF" "nokey" "s1")))))
+
+(deftest sinter-picks-smallest-set-first
+  (testing "引数の順序によらず性能が変わらない（大きい集合で計測）"
+    (let [c (ctx)]
+      (command/dispatch c (into ["SADD" "big"] (map str (range 50000))))
+      (run c "SADD" "small" "1" "2" "3")
+      (let [t1 (let [s (System/nanoTime)]
+                 (dotimes [_ 50] (run c "SINTER" "small" "big"))
+                 (- (System/nanoTime) s))
+            t2 (let [s (System/nanoTime)]
+                 (dotimes [_ 50] (run c "SINTER" "big" "small"))
+                 (- (System/nanoTime) s))]
+        (is (< (/ (max t1 t2) (min t1 t2)) 10)
+            (str "引数順で性能が大きく変わる: " (float (/ (max t1 t2) (min t1 t2))) "倍"))))))
+
+;; ---------- 型チェック（Hash/Set） ----------
+
+(deftest wrong-type-across-all-types
+  (let [c (ctx)
+        expected "WRONGTYPE Operation against a key holding the wrong kind of value"]
+    (run c "SET" "s" "v")
+    (run c "RPUSH" "l" "a")
+    (run c "HSET" "h" "f" "v")
+    (run c "SADD" "st" "m")
+
+    (testing "Hash コマンドを他の型に"
+      (is (= expected (err-msg (run c "HGET" "s" "f"))))
+      (is (= expected (err-msg (run c "HSET" "l" "f" "v"))))
+      (is (= expected (err-msg (run c "HGETALL" "st"))))
+      (is (= expected (err-msg (run c "HINCRBY" "s" "f" "1")))))
+
+    (testing "Set コマンドを他の型に"
+      (is (= expected (err-msg (run c "SADD" "s" "m"))))
+      (is (= expected (err-msg (run c "SMEMBERS" "l"))))
+      (is (= expected (err-msg (run c "SCARD" "h"))))
+      (is (= expected (err-msg (run c "SPOP" "s")))))
+
+    (testing "他の型のコマンドを Hash/Set に"
+      (is (= expected (err-msg (run c "GET" "h"))))
+      (is (= expected (err-msg (run c "LPUSH" "st" "x"))))
+      (is (= expected (err-msg (run c "LRANGE" "h" "0" "-1")))))
+
+    (testing "集合演算で型違いが混ざったら"
+      (is (= expected (err-msg (run c "SINTER" "st" "l"))))
+      (is (= expected (err-msg (run c "SUNION" "s" "st")))))))
+
+(deftest type-command-reports-all-types
+  (let [c (ctx)]
+    (run c "SET" "s" "v")
+    (run c "RPUSH" "l" "a")
+    (run c "HSET" "h" "f" "v")
+    (run c "SADD" "st" "m")
+    (is (= "string" (:value (run c "TYPE" "s"))))
+    (is (= "list"   (:value (run c "TYPE" "l"))))
+    (is (= "hash"   (:value (run c "TYPE" "h"))))
+    (is (= "set"    (:value (run c "TYPE" "st"))))))
+
+;; ---------- OBJECT ----------
+
+(deftest object-encoding-reports-implementation
+  (testing "エンコーディング最適化は未実装なので常に非圧縮側を返す"
+    (let [c (ctx)]
+      (run c "SET" "s" "v")
+      (run c "RPUSH" "l" "a")
+      (run c "HSET" "h" "f" "v")
+      (run c "SADD" "st" "m")
+      (is (= "embstr"    (:value (run c "OBJECT" "ENCODING" "s"))))
+      (is (= "quicklist" (:value (run c "OBJECT" "ENCODING" "l"))))
+      (is (= "hashtable" (:value (run c "OBJECT" "ENCODING" "h"))))
+      (is (= "hashtable" (:value (run c "OBJECT" "ENCODING" "st")))))))
+
+(deftest object-encoding-on-missing-key
+  (is (= "ERR no such key" (err-msg (run (ctx) "OBJECT" "ENCODING" "nokey")))))
+
+;; ---------- 並行性 ----------
+
+(deftest concurrent-sadd-loses-nothing
+  (let [c (ctx)
+        threads 20
+        per-thread 100]
+    (->> (range threads)
+         (map (fn [t] (future (dotimes [i per-thread]
+                                (command/dispatch c ["SADD" "s" (str t "-" i)])))))
+         doall
+         (run! deref))
+    (is (= (* threads per-thread) (run c "SCARD" "s")))))
+
+(deftest concurrent-hincrby-is-atomic
+  (let [c (ctx)
+        threads 20
+        per-thread 100]
+    (->> (range threads)
+         (map (fn [_] (future (dotimes [_ per-thread]
+                                (command/dispatch c ["HINCRBY" "h" "n" "1"])))))
+         doall
+         (run! deref))
+    (is (= (str (* threads per-thread)) (run c "HGET" "h" "n")))))
+
+(deftest concurrent-spop-does-not-duplicate
+  (let [c (ctx)
+        n 1000]
+    (command/dispatch c (into ["SADD" "s"] (map str (range n))))
+    (let [results (->> (range 10)
+                       (map (fn [_]
+                              (future
+                                (loop [acc []]
+                                  (if-let [v (command/dispatch c ["SPOP" "s"])]
+                                    (recur (conj acc v))
+                                    acc)))))
+                       doall
+                       (mapcat deref))]
+      (is (= n (count results)))
+      (is (= n (count (set results))) "重複した要素がある"))))
