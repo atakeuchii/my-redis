@@ -345,6 +345,79 @@
                         [(dlist/assoc-nth l idx v) (resp/simple "OK")]))))
     not-integer-error))
 
+(defn- hash-update! [ctx k f]
+  (let [outcome (atom nil)]
+    (db/update-entry!
+     (:db ctx) k
+     (fn [e]
+       (if (and (some? e) (not= :hash (:type e)))
+         (do (reset! outcome wrong-type-error) e)
+         (let [current (if e (:value e) {})
+               [next ret] (f current)]
+           (reset! outcome ret)
+           (when-let [nv (not-empty next)]
+             (db/entry :hash nv))))))
+    @outcome))
+
+(defn- hash-read [ctx k f]
+  (let [v (db/typed-value (:db ctx) k :hash {})]
+    (if (db/wrong-type? v)
+      wrong-type-error
+      (f v))))
+
+(defn- cmd-hset [ctx [k & fvs]]
+  (if (or (empty? fvs) (odd? (count fvs)))
+    (resp/error "ERR wrong number of arguments for 'hset' command")
+    (hash-update! ctx k
+                  (fn [m]
+                    (let [pairs (partition 2 fvs)
+                          added (count (remove #(contains? m (first %)) pairs))
+                          next (reduce (fn [acc [f v]] (assoc acc f v)) m pairs)]
+                      [next added])))))
+
+(defn- cmd-hget [ctx [k f]]
+  (hash-read ctx k #(get % f)))
+
+(defn- cmd-hdel [ctx [k & fs]]
+  (hash-update! ctx k
+                (fn [m]
+                  (let [removed (count (filter #(contains? m %) (distinct fs)))]
+                    [(apply dissoc m fs) removed]))))
+
+(defn- cmd-hgetall [ctx [k]]
+  (hash-read ctx k (fn [m] (into [] (mapcat identity) m))))
+
+(defn- cmd-hkeys [ctx [k]]
+  (hash-read ctx k #(into [] (keys %))))
+
+(defn- cmd-hvals [ctx [k]]
+  (hash-read ctx k #(into [] (vals %))))
+
+(defn- cmd-hlen [ctx [k]]
+  (hash-read ctx k count))
+
+(defn- cmd-hexists [ctx [k f]]
+  (hash-read ctx k #(if (contains? % f) 1 0)))
+
+(defn- cmd-hincrby [ctx [k f delta]]
+  (if-let [d (parse-long-or-nil delta)]
+    (hash-update! ctx k
+                  (fn [m]
+                    (let [current (get m f "0")
+                          n (parse-long-or-nil current)]
+                      (cond
+                        (nil? n)
+                        [m (resp/error "ERR hash value is not an integer")]
+                        
+                        (or (and (pos? d) (> n (- Long/MAX_VALUE d)))
+                            (and (neg? d) (< n (- Long/MIN_VALUE d))))
+                        [m (resp/error "ERR increment or decrement would overflow")]
+                        
+                        :else
+                        (let [next (+ n d)]
+                          [(assoc m f (str next)) next])))))
+    not-integer-error))
+
 (def command-table
   {"PING"    {:arity -1 :write? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :handler cmd-echo}
@@ -379,7 +452,17 @@
    "LLEN"   {:arity  2 :write? false :handler cmd-llen}
    "LRANGE" {:arity  4 :write? false :handler cmd-lrange}
    "LINDEX" {:arity  3 :write? false :handler cmd-lindex}
-   "LSET"   {:arity  4 :write? true  :handler cmd-lset}})
+   "LSET"   {:arity  4 :write? true  :handler cmd-lset}
+   
+   "HSET"     {:arity -4 :write? true  :handler cmd-hset}
+   "HGET"     {:arity  3 :write? false :handler cmd-hget}
+   "HDEL"     {:arity -3 :write? true  :handler cmd-hdel}
+   "HGETALL"  {:arity  2 :write? false :handler cmd-hgetall}
+   "HKEYS"    {:arity  2 :write? false :handler cmd-hkeys}
+   "HVALS"    {:arity  2 :write? false :handler cmd-hvals}
+   "HLEN"     {:arity  2 :write? false :handler cmd-hlen}
+   "HEXISTS"  {:arity  3 :write? false :handler cmd-hexists}
+   "HINCRBY"  {:arity  4 :write? true  :handler cmd-hincrby}})
 
 (defn- arity-ok?
   [^long arity ^long n]
