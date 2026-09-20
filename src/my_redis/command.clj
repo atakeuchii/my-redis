@@ -418,6 +418,119 @@
                           [(assoc m f (str next)) next])))))
     not-integer-error))
 
+(defn- set-update!
+  [ctx k f]
+  (let [outcome (atom nil)]
+    (db/update-entry!
+     (:db ctx) k
+     (fn [e]
+       (if (and (some? e) (not= :set (:type e)))
+         (do (reset! outcome wrong-type-error) e)
+         (let [current (if e (:value e) #{})
+               [next ret] (f current)]
+           (reset! outcome ret)
+           (when-let [nv (not-empty next)]
+             (db/entry :set nv))))))
+    @outcome))
+
+(defn- set-read
+  [ctx k f]
+  (let [v (db/typed-value (:db ctx) k :set #{})]
+    (if (db/wrong-type? v)
+      wrong-type-error
+      (f v))))
+
+(defn- cmd-sadd [ctx [k & ms]]
+  (set-update! ctx k
+               (fn [s]
+                 (let [added (count (remove #(contains? s %) (distinct ms)))]
+                   [(into s ms) added]))))
+
+(defn- cmd-srem [ctx [k & ms]]
+  (set-update! ctx k
+               (fn [s]
+                 (let [removed (count (filter #(contains? s %) (distinct ms)))]
+                   [(apply disj s ms) removed]))))
+
+(defn- cmd-smembers [ctx [k]]
+  (set-read ctx k #(into [] %)))
+
+(defn- cmd-sismember [ctx [k m]]
+  (set-read ctx k #(if (contains? % m) 1 0)))
+
+(defn- cmd-scard [ctx [k]]
+  (set-read ctx k count))
+
+(defn- cmd-spop [ctx [k]]
+  (set-update! ctx k
+               (fn [s]
+                 (if (empty? s)
+                   [s nil]
+                   (let [m (rand-nth (vec s))]
+                     [(disj s m) m])))))
+
+(defn- fetch-sets [ctx ks]
+  (let [snap (db/snapshot (:db ctx))]
+    (reduce (fn [acc k]
+              (let [e (db/entry-in snap k)]
+                (cond
+                  (nil? e) (conj acc #{})
+                  (= :set (:type e)) (conj acc (:value e))
+                  :else (reduced db/wrong-type))))
+            []
+            ks)))
+
+(defn- cmd-sinter [ctx ks]
+  (let [sets (fetch-sets ctx ks)]
+    (if (db/wrong-type? sets)
+      wrong-type-error
+      (let [sorted (sort-by count sets)]
+        (into [] (reduce (fn [acc s]
+                           (if (empty? acc)
+                             (reduced acc)
+                             (into #{} (filter #(contains? s %)) acc)))
+                         (first sorted)
+                         (rest sorted)))))))
+
+(defn- cmd-sunion [ctx ks]
+  (let [sets (fetch-sets ctx ks)]
+    (if (db/wrong-type? sets)
+      wrong-type-error
+      (into [] (reduce into #{} sets)))))
+
+(defn- cmd-sdiff [ctx ks]
+  (let [sets (fetch-sets ctx ks)]
+    (if (db/wrong-type? sets)
+      wrong-type-error
+      (into [] (reduce (fn [acc s]
+                         (into #{} (remove #(contains? s %)) acc))
+                       (first sets)
+                       (rest sets))))))
+
+(defn- encoding-name [type]
+  (case type
+    :string "embstr"
+    :list   "quicklist"
+    :hash   "hashtable"
+    :set    "hashtable"
+    :zset   "skiplist"
+    nil))
+
+(defn- cmd-object [ctx [subcmd k]]
+  (let [sub (str/upper-case (or subcmd ""))]
+    (case sub
+      "ENCODING"
+      (if-let [t (db/key-type (:db ctx) k)]
+        (resp/simple (encoding-name t))
+        (resp/error "ERR no such key"))
+
+      "HELP"
+      [(resp/simple "OBJECT <subcommand> key")
+       (resp/simple "ENCODING key -- Return the kind of internal representation used.")]
+
+      (resp/error (str "ERR Unknown subcommand or wrong number of arguments for '"
+                       subcmd "'. Try OBJECT HELP.")))))
+
 (def command-table
   {"PING"    {:arity -1 :write? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :handler cmd-echo}
@@ -462,7 +575,19 @@
    "HVALS"    {:arity  2 :write? false :handler cmd-hvals}
    "HLEN"     {:arity  2 :write? false :handler cmd-hlen}
    "HEXISTS"  {:arity  3 :write? false :handler cmd-hexists}
-   "HINCRBY"  {:arity  4 :write? true  :handler cmd-hincrby}})
+   "HINCRBY"  {:arity  4 :write? true  :handler cmd-hincrby}
+   
+   "SADD"      {:arity -3 :write? true  :handler cmd-sadd}
+   "SREM"      {:arity -3 :write? true  :handler cmd-srem}
+   "SMEMBERS"  {:arity  2 :write? false :handler cmd-smembers}
+   "SISMEMBER" {:arity  3 :write? false :handler cmd-sismember}
+   "SCARD"     {:arity  2 :write? false :handler cmd-scard}
+   "SPOP"      {:arity  2 :write? true  :handler cmd-spop}
+   "SINTER"    {:arity -2 :write? false :handler cmd-sinter}
+   "SUNION"    {:arity -2 :write? false :handler cmd-sunion}
+   "SDIFF"     {:arity -2 :write? false :handler cmd-sdiff}
+   
+   "OBJECT" {:arity -2 :write? false :handler cmd-object}})
 
 (defn- arity-ok?
   [^long arity ^long n]
