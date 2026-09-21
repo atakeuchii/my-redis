@@ -58,8 +58,8 @@
 
 (defn range-by-score
   [^ZSet z min min-excl? max max-excl?]
-  (->> (:sorted z)
-       (drop-while (fn [[s _]] (if min-excl? (<= s min) (< s min))))
+  (->> (subseq (:sorted z) >= [min nil])
+       (drop-while (fn [[s _]] (and min-excl? (== s min))))
        (take-while (fn [[s _]] (if max-excl? (< s max) (<= s max))))
        (into [])))
 

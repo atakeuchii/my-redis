@@ -23,6 +23,9 @@
 (def ^:private not-float-error
   (resp/error "ERR value is not a valid float"))
 
+(def ^:private min-max-error
+  (resp/error "ERR min or max is not a float"))
+
 (defn- byte-length ^long [^String s]
   (alength (.getBytes s "UTF-8")))
 
@@ -94,10 +97,10 @@
            (cond
              (and (= :nx exists) (some? existing))
              (do (reset! outcome nil) existing)
-             
+
              (and (= :xx exists) (nil? existing))
              (do (reset! outcome nil) nil)
-             
+
              :else
              (do (reset! outcome (resp/simple "OK"))
                  (cond-> (db/entry :string v)
@@ -412,11 +415,11 @@
                       (cond
                         (nil? n)
                         [m (resp/error "ERR hash value is not an integer")]
-                        
+
                         (or (and (pos? d) (> n (- Long/MAX_VALUE d)))
                             (and (neg? d) (< n (- Long/MIN_VALUE d))))
                         [m (resp/error "ERR increment or decrement would overflow")]
-                        
+
                         :else
                         (let [next (+ n d)]
                           [(assoc m f (str next)) next])))))
@@ -578,7 +581,7 @@
   (cond
     (odd? (count sms))
     (resp/error "ERR syntax error")
-    
+
     :else
     (let [pairs (partition 2 sms)
           parsed (map (fn [[s m]] [(parse-score s) m]) pairs)]
@@ -615,6 +618,87 @@
                         [(zset/add z m next-score) (format-score next-score)]))))
     not-float-error))
 
+(defn- parse-score-bound [^String s]
+  (let [excl? (str/starts-with? s "(")
+        body (if excl? (subs s 1) s)]
+    (when-let [d (parse-score body)]
+      [d excl?])))
+
+(defn- parse-withscores [opts]
+  (cond
+    (empty? opts) false
+    (and (= 1 (count opts))
+         (= "WITHSCORES" (str/upper-case (first opts)))) true
+    :else :syntax-error))
+
+(defn- render-entries [entries withscores?]
+  (if withscores?
+    (into [] (mapcat (fn [[s m]] [m (format-score s)])) entries)
+    (mapv second entries)))
+
+(defn- cmd-zrange [ctx [k start stop & opts]]
+  (let [s (parse-long-or-nil start)
+        e (parse-long-or-nil stop)
+        ws (parse-withscores opts)]
+    (cond
+      (or (nil? s) (nil? e)) not-integer-error
+      (= ws :syntax-error) (resp/error "ERR syntax error")
+      :else (zset-read ctx k
+                       (fn [z]
+                         (render-entries
+                          (if-let [[from to] (clamp-range s e (zset/card z))]
+                            (zset/range-by-rank z from to)
+                            [])
+                          ws))))))
+
+(defn- cmd-zrevrange [ctx [k start stop & opts]]
+  (let [s  (parse-long-or-nil start)
+        e  (parse-long-or-nil stop)
+        ws (parse-withscores opts)]
+    (cond
+      (or (nil? s) (nil? e)) not-integer-error
+      (= ws :syntax-error) (resp/error "ERR syntax error")
+      :else (zset-read ctx k
+                       (fn [z]
+                         (let [n (zset/card z)]
+                           (render-entries
+                            (if-let [[from to] (clamp-range s e n)]
+                              (rseq (zset/range-by-rank z (- n 1 to) (- n 1 from)))
+                              [])
+                            ws)))))))
+
+(defn- cmd-zrangebyscore [ctx [k mn mx & opts]]
+  (let [lo (parse-score-bound mn)
+        hi (parse-score-bound mx)
+        ws (parse-withscores opts)]
+    (cond
+      (or (nil? lo) (nil? hi)) min-max-error
+      (= ws :syntax-error) (resp/error "ERR syntax error")
+      :else (zset-read ctx k
+                       (fn [z]
+                         (render-entries
+                          (zset/range-by-score z (first lo) (second lo) (first hi) (second hi))
+                          ws))))))
+
+(defn- cmd-zcount [ctx [k mn mx]]
+  (let [lo (parse-score-bound mn)
+        hi (parse-score-bound mx)]
+    (if (or (nil? lo) (nil? hi))
+      min-max-error
+      (zset-read ctx k
+                 (fn [z]
+                   (count (zset/range-by-score z (first lo) (second lo)
+                                               (first hi) (second hi))))))))
+
+(defn- cmd-zrank [ctx [k m]]
+  (zset-read ctx k #(zset/rank % m)))
+
+(defn- cmd-zrevrank [ctx [k m]]
+  (zset-read ctx k
+             (fn [z]
+               (when-let [r (zset/rank z m)]
+                 (- (zset/card z) 1 r)))))
+
 (def command-table
   {"PING"    {:arity -1 :write? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :handler cmd-echo}
@@ -634,14 +718,14 @@
    "DECR"    {:arity  2 :write? true  :handler cmd-decr}
    "INCRBY"  {:arity  3 :write? true  :handler cmd-incrby}
    "DECRBY"  {:arity  3 :write? true  :handler cmd-decrby}
-   
+
    "APPEND" {:arity 3 :write? true  :handler cmd-append}
    "STRLEN" {:arity 2 :write? false :handler cmd-strlen}
    "GETSET" {:arity 3 :write? true  :handler cmd-getset}
    "SETNX"  {:arity 3 :write? true  :handler cmd-setnx}
    "MSET"   {:arity -3 :write? true  :handler cmd-mset}
    "MGET"   {:arity -2 :write? false :handler cmd-mget}
-   
+
    "RPUSH"  {:arity -3 :write? true  :handler cmd-rpush}
    "LPUSH"  {:arity -3 :write? true  :handler cmd-lpush}
    "RPOP"   {:arity  2 :write? true  :handler cmd-rpop}
@@ -650,7 +734,7 @@
    "LRANGE" {:arity  4 :write? false :handler cmd-lrange}
    "LINDEX" {:arity  3 :write? false :handler cmd-lindex}
    "LSET"   {:arity  4 :write? true  :handler cmd-lset}
-   
+
    "HSET"     {:arity -4 :write? true  :handler cmd-hset}
    "HGET"     {:arity  3 :write? false :handler cmd-hget}
    "HDEL"     {:arity -3 :write? true  :handler cmd-hdel}
@@ -660,7 +744,7 @@
    "HLEN"     {:arity  2 :write? false :handler cmd-hlen}
    "HEXISTS"  {:arity  3 :write? false :handler cmd-hexists}
    "HINCRBY"  {:arity  4 :write? true  :handler cmd-hincrby}
-   
+
    "SADD"      {:arity -3 :write? true  :handler cmd-sadd}
    "SREM"      {:arity -3 :write? true  :handler cmd-srem}
    "SMEMBERS"  {:arity  2 :write? false :handler cmd-smembers}
@@ -671,12 +755,18 @@
    "SUNION"    {:arity -2 :write? false :handler cmd-sunion}
    "SDIFF"     {:arity -2 :write? false :handler cmd-sdiff}
 
-   "ZADD"    {:arity -4 :write? true  :handler cmd-zadd}
-   "ZSCORE"  {:arity  3 :write? false :handler cmd-zscore}
-   "ZCARD"   {:arity  2 :write? false :handler cmd-zcard}
-   "ZREM"    {:arity -3 :write? true  :handler cmd-zrem}
-   "ZINCRBY" {:arity  4 :write? true  :handler cmd-zincrby}
-   
+   "ZADD"          {:arity -4 :write? true  :handler cmd-zadd}
+   "ZSCORE"        {:arity  3 :write? false :handler cmd-zscore}
+   "ZCARD"         {:arity  2 :write? false :handler cmd-zcard}
+   "ZREM"          {:arity -3 :write? true  :handler cmd-zrem}
+   "ZINCRBY"       {:arity  4 :write? true  :handler cmd-zincrby}
+   "ZRANGE"        {:arity -4 :write? false :handler cmd-zrange}
+   "ZREVRANGE"     {:arity -4 :write? false :handler cmd-zrevrange}
+   "ZRANGEBYSCORE" {:arity -4 :write? false :handler cmd-zrangebyscore}
+   "ZCOUNT"        {:arity  4 :write? false :handler cmd-zcount}
+   "ZRANK"         {:arity 3 :write? false :handler cmd-zrank}
+   "ZREVRANK"      {:arity 3 :write? false :handler cmd-zrevrank}
+
    "OBJECT" {:arity -2 :write? false :handler cmd-object}})
 
 (defn- arity-ok?
