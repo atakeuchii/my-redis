@@ -2,7 +2,8 @@
   (:require [clojure.string :as str]
             [my-redis.resp :as resp]
             [my-redis.db :as db]
-            [my-redis.types.list :as dlist]))
+            [my-redis.types.list :as dlist]
+            [my-redis.types.zset :as zset]))
 
 ;; ---------- ハンドラ ----------
 ;; シグネチャ: (fn [ctx args] -> reply)
@@ -18,6 +19,9 @@
 
 (def ^:private overflow-error
   (resp/error "ERR increment or decrement would overflow"))
+
+(def ^:private not-float-error
+  (resp/error "ERR value is not a valid float"))
 
 (defn- byte-length ^long [^String s]
   (alength (.getBytes s "UTF-8")))
@@ -531,6 +535,86 @@
       (resp/error (str "ERR Unknown subcommand or wrong number of arguments for '"
                        subcmd "'. Try OBJECT HELP.")))))
 
+(defn- parse-score [^String s]
+  (case (str/lower-case s)
+    ("inf" "+inf") Double/POSITIVE_INFINITY
+    "-inf" Double/NEGATIVE_INFINITY
+    (when-not (or (str/blank? s)
+                  (not= s (str/trim s))
+                  (#{\d \D \f \F} (last s)))
+      (try
+        (let [d (Double/parseDouble s)]
+          (when-not (Double/isNaN d) d))
+        (catch NumberFormatException _ nil)))))
+
+(defn- format-score ^String [^double s]
+  (cond
+    (= s Double/POSITIVE_INFINITY) "inf"
+    (= s Double/NEGATIVE_INFINITY) "-inf"
+    (and (== s (Math/rint s)) (< (Math/abs s) 1e17)) (str (long s))
+    :else (str s)))
+
+(defn- zset-update! [ctx k f]
+  (let [outcome (atom nil)]
+    (db/update-entry!
+     (:db ctx) k
+     (fn [e]
+       (if (and (some? e) (not= :zset (:type e)))
+         (do (reset! outcome wrong-type-error) e)
+         (let [current (if e (:value e) zset/empty-zset)
+               [next ret] (f current)]
+           (reset! outcome ret)
+           (when-not (zset/empty-zset? next)
+             (db/entry :zset next))))))
+    @outcome))
+
+(defn- zset-read [ctx k f]
+  (let [v (db/typed-value (:db ctx) k :zset zset/empty-zset)]
+    (if (db/wrong-type? v)
+      wrong-type-error
+      (f v))))
+
+(defn- cmd-zadd [ctx [k & sms]]
+  (cond
+    (odd? (count sms))
+    (resp/error "ERR syntax error")
+    
+    :else
+    (let [pairs (partition 2 sms)
+          parsed (map (fn [[s m]] [(parse-score s) m]) pairs)]
+      (if (some (comp nil? first) parsed)
+        not-float-error
+        (zset-update! ctx k
+                      (fn [z]
+                        (let [added (count (remove #(zset/score z %)
+                                                   (distinct (map second parsed))))
+                              next (reduce (fn [acc [s m]] (zset/add acc m s)) z parsed)]
+                          [next added])))))))
+
+(defn- cmd-zscore [ctx [k m]]
+  (zset-read ctx k (fn [z]
+                     (when-let [s (zset/score z m)]
+                       (format-score s)))))
+
+(defn- cmd-zcard [ctx [k]]
+  (zset-read ctx k zset/card))
+
+(defn- cmd-zrem [ctx [k & ms]]
+  (zset-update! ctx k
+                (fn [z]
+                  (let [removed (count (filter #(zset/score z %) (distinct ms)))]
+                    [(reduce zset/remove z ms) removed]))))
+
+(defn- cmd-zincrby [ctx [k delta m]]
+  (if-let [d (parse-score delta)]
+    (zset-update! ctx k
+                  (fn [z]
+                    (let [next-score (+ (or (zset/score z m) 0.0) d)]
+                      (if (Double/isNaN next-score)
+                        [z (resp/error "ERR resulting score is not a number (NaN)")]
+                        [(zset/add z m next-score) (format-score next-score)]))))
+    not-float-error))
+
 (def command-table
   {"PING"    {:arity -1 :write? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :handler cmd-echo}
@@ -586,6 +670,12 @@
    "SINTER"    {:arity -2 :write? false :handler cmd-sinter}
    "SUNION"    {:arity -2 :write? false :handler cmd-sunion}
    "SDIFF"     {:arity -2 :write? false :handler cmd-sdiff}
+
+   "ZADD"    {:arity -4 :write? true  :handler cmd-zadd}
+   "ZSCORE"  {:arity  3 :write? false :handler cmd-zscore}
+   "ZCARD"   {:arity  2 :write? false :handler cmd-zcard}
+   "ZREM"    {:arity -3 :write? true  :handler cmd-zrem}
+   "ZINCRBY" {:arity  4 :write? true  :handler cmd-zincrby}
    
    "OBJECT" {:arity -2 :write? false :handler cmd-object}})
 
