@@ -957,3 +957,138 @@
                        (mapcat deref))]
       (is (= n (count results)))
       (is (= n (count (set results))) "重複した要素がある"))))
+
+;; ---------- ZSet: 基本 ----------
+
+(deftest zadd-counts-new-members
+  (let [c (ctx)]
+    (is (= 3 (run c "ZADD" "z" "1" "a" "2" "b" "3" "c")))
+    (is (= 0 (run c "ZADD" "z" "5" "a")))
+    (is (= 1 (run c "ZADD" "z2" "1" "a" "2" "a")))
+    (is (= "2" (run c "ZSCORE" "z2" "a")))))
+
+(deftest zscore-formatting
+  (let [c (ctx)]
+    (run c "ZADD" "z" "1.5" "a" "2.0" "b" "1e3" "c" "inf" "d" "-inf" "e")
+    (is (= "1.5" (run c "ZSCORE" "z" "a")))
+    (is (= "2" (run c "ZSCORE" "z" "b")))
+    (is (= "1000" (run c "ZSCORE" "z" "c")))
+    (is (= "inf" (run c "ZSCORE" "z" "d")))
+    (is (= "-inf" (run c "ZSCORE" "z" "e")))
+    (is (nil? (run c "ZSCORE" "z" "nope")))))
+
+(deftest zadd-rejects-invalid-scores
+  (let [c (ctx)]
+    (doseq [bad ["nan" "abc" "1d" "1f" " 1 " ""]]
+      (is (= "ERR value is not a valid float" (err-msg (run c "ZADD" "z" bad "a")))
+          (str "受理してはいけない: " (pr-str bad))))
+    (is (= 0 (run c "EXISTS" "z")))))
+
+(deftest zadd-odd-arguments
+  (is (= "ERR syntax error" (err-msg (run (ctx) "ZADD" "z" "1" "a" "2")))))
+
+(deftest zincrby-behaviour
+  (let [c (ctx)]
+    (is (= "5" (run c "ZINCRBY" "z" "5" "a")))
+    (is (= "7.5" (run c "ZINCRBY" "z" "2.5" "a")))
+    (run c "ZADD" "z" "inf" "b")
+    (is (= "ERR resulting score is not a number (NaN)"
+           (err-msg (run c "ZINCRBY" "z" "-inf" "b"))))
+    (is (= "inf" (run c "ZSCORE" "z" "b")))))
+
+(deftest zrem-and-empty-deletes-key
+  (let [c (ctx)]
+    (run c "ZADD" "z" "1" "a" "2" "b")
+    (is (= 2 (run c "ZREM" "z" "a" "b" "nope")))
+    (is (= 0 (run c "EXISTS" "z")))))
+
+;; ---------- ZSet: 順序 ----------
+
+(deftest ties-ordered-by-member
+  (let [c (ctx)]
+    (run c "ZADD" "z" "1" "banana" "1" "apple" "1" "cherry")
+    (is (= ["apple" "banana" "cherry"] (run c "ZRANGE" "z" "0" "-1")))
+    (is (= 2 (run c "ZRANK" "z" "cherry")))))
+
+(deftest score-update-leaves-no-ghost
+  (testing "スコア更新後、全コマンドが一貫した結果を返す"
+    (let [c (ctx)]
+      (run c "ZADD" "z" "1" "a" "3" "b")
+      (run c "ZADD" "z" "5" "a")
+      (is (= 2 (run c "ZCARD" "z")))
+      (is (= ["b" "a"] (run c "ZRANGE" "z" "0" "-1")))
+      (is (= 1 (run c "ZRANK" "z" "a")))
+      (is (= 0 (run c "ZRANK" "z" "b")))
+      (is (= [] (run c "ZRANGEBYSCORE" "z" "0" "2")))
+      (is (= 2 (run c "ZCOUNT" "z" "-inf" "+inf"))))))
+
+;; ---------- ZSet: 範囲 ----------
+
+(deftest zrange-and-zrevrange
+  (let [c (ctx)]
+    (run c "ZADD" "z" "10" "a" "20" "b" "30" "c" "40" "d")
+    (is (= ["b" "c"] (run c "ZRANGE" "z" "1" "2")))
+    (is (= ["d" "c"] (run c "ZREVRANGE" "z" "0" "1")))
+    (is (= ["a"] (run c "ZREVRANGE" "z" "-1" "-1")))
+    (is (= ["d" "c" "b" "a"] (run c "ZREVRANGE" "z" "0" "999")))
+    (is (= [] (run c "ZRANGE" "z" "10" "20")))
+    (is (= ["a" "10" "b" "20"] (run c "ZRANGE" "z" "0" "1" "WITHSCORES")))
+    (is (= ["d" "40"] (run c "ZREVRANGE" "z" "0" "0" "withscores")))
+    (is (= "ERR syntax error" (err-msg (run c "ZRANGE" "z" "0" "1" "FOO"))))))
+
+(deftest zrangebyscore-bounds
+  (let [c (ctx)]
+    (run c "ZADD" "z" "10" "a" "20" "b" "30" "c" "40" "d")
+    (is (= ["b" "c"] (run c "ZRANGEBYSCORE" "z" "20" "30")))
+    (is (= ["c"] (run c "ZRANGEBYSCORE" "z" "(20" "30")))
+    (is (= [] (run c "ZRANGEBYSCORE" "z" "(20" "(30")))
+    (is (= [] (run c "ZRANGEBYSCORE" "z" "30" "10")))
+    (is (= ["a" "b" "c" "d"] (run c "ZRANGEBYSCORE" "z" "-inf" "+inf")))
+    (is (= ["c" "30"] (run c "ZRANGEBYSCORE" "z" "25" "35" "WITHSCORES")))
+    (is (= "ERR min or max is not a float" (err-msg (run c "ZRANGEBYSCORE" "z" "abc" "30"))))))
+
+(deftest zcount-counts
+  (let [c (ctx)]
+    (run c "ZADD" "z" "10" "a" "20" "b" "30" "c")
+    (is (= 3 (run c "ZCOUNT" "z" "-inf" "+inf")))
+    (is (= 1 (run c "ZCOUNT" "z" "(10" "(30")))))
+
+;; ---------- ZSet: 順位・不在・型 ----------
+
+(deftest zrank-and-zrevrank
+  (let [c (ctx)]
+    (run c "ZADD" "z" "10" "a" "20" "b" "30" "c")
+    (is (= 0 (run c "ZRANK" "z" "a")))
+    (is (= 2 (run c "ZREVRANK" "z" "a")))
+    (is (nil? (run c "ZRANK" "z" "nope")))
+    (is (nil? (run c "ZREVRANK" "z" "nope")))))
+
+(deftest zset-commands-on-missing-key
+  (let [c (ctx)]
+    (is (= 0 (run c "ZCARD" "nokey")))
+    (is (= [] (run c "ZRANGE" "nokey" "0" "-1")))
+    (is (= [] (run c "ZRANGEBYSCORE" "nokey" "-inf" "+inf")))
+    (is (nil? (run c "ZSCORE" "nokey" "m")))
+    (is (nil? (run c "ZRANK" "nokey" "m")))))
+
+(deftest zset-wrong-type
+  (let [c (ctx)
+        expected "WRONGTYPE Operation against a key holding the wrong kind of value"]
+    (run c "SET" "s" "v")
+    (run c "ZADD" "z" "1" "a")
+    (is (= expected (err-msg (run c "ZADD" "s" "1" "a"))))
+    (is (= expected (err-msg (run c "ZRANGE" "s" "0" "-1"))))
+    (is (= expected (err-msg (run c "ZRANK" "s" "a"))))
+    (is (= expected (err-msg (run c "GET" "z"))))
+    (is (= expected (err-msg (run c "SMEMBERS" "z"))))
+    (is (= "zset" (:value (run c "TYPE" "z"))))
+    (is (= "skiplist" (:value (run c "OBJECT" "ENCODING" "z"))))))
+
+(deftest concurrent-zincrby-is-atomic
+  (let [c (ctx)]
+    (->> (range 20)
+         (map (fn [_] (future (dotimes [_ 100]
+                                (command/dispatch c ["ZINCRBY" "z" "1" "m"])))))
+         doall
+         (run! deref))
+    (is (= "2000" (run c "ZSCORE" "z" "m")))))
