@@ -200,6 +200,27 @@
       (recur (next-at x 0) (dec n) (conj! acc [(.score x) (.member x)]))
       (persistent! acc))))
 
+(defn range-by-score
+  "スコアが範囲内の [score member] を昇順で返す。開始位置まで O(log N)。"
+  [^SkipList sl mn min-excl? mx max-excl?]
+  (let [mn (double mn)
+        mx (double mx)
+        below-min? (fn [^double s] (if min-excl? (<= s mn) (< s mn)))
+        within-max? (fn [^double s] (if max-excl? (< s mx) (<= s mx)))
+        start (loop [i (dec (level sl))
+                     ^Node x (.header sl)]
+                (if (neg? i)
+                  (next-at x 0)
+                  (let [^Node nxt (next-at x i)]
+                    (if (and nxt (below-min? (.score nxt)))
+                      (recur i nxt)
+                      (recur (dec i) x)))))]
+    (loop [^Node x start
+           acc (transient [])]
+      (if (and x (within-max? (.score x)))
+        (recur (next-at x 0) (conj! acc [(.score x) (.member x)]))
+        (persistent! acc)))))
+
 (defn entries
   "全要素を [score member] のベクタで昇順に返す。"
   [^SkipList sl]
