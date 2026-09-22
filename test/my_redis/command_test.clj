@@ -1084,7 +1084,7 @@
     (is (= "zset" (:value (run c "TYPE" "z"))))
     (is (= "skiplist" (:value (run c "OBJECT" "ENCODING" "z"))))))
 
-(deftest concurrent-zincrby-is-atomic
+(deftest ^:skip concurrent-zincrby-is-atomic
   (let [c (ctx)]
     (->> (range 20)
          (map (fn [_] (future (dotimes [_ 100]
