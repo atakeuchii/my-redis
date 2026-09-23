@@ -650,6 +650,134 @@
         (is (= n (count results)))
         (is (= n (count (set results))) "重複した要素がある")))))
 
+;; ---------- LREM ----------
+
+(deftest lrem-positive-count-removes-from-head
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "a" "c" "a" "b" "a")
+    (is (= 2 (run c "LREM" "l" "2" "a")))
+    (is (= ["b" "c" "a" "b" "a"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest lrem-negative-count-removes-from-tail
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "a" "c" "a" "b" "a")
+    (is (= 2 (run c "LREM" "l" "-2" "a")))
+    (is (= ["a" "b" "a" "c" "b"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest lrem-zero-count-removes-all
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "a" "c" "a")
+    (is (= 3 (run c "LREM" "l" "0" "a")))
+    (is (= ["b" "c"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest lrem-count-exceeding-occurrences
+  (testing "指定数より少なければあるだけ削除する"
+    (let [c (ctx)]
+      (run c "RPUSH" "l" "a" "b" "a")
+      (is (= 2 (run c "LREM" "l" "99" "a")))
+      (is (= ["b"] (run c "LRANGE" "l" "0" "-1"))))))
+
+(deftest lrem-no-match
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b")
+    (is (= 0 (run c "LREM" "l" "0" "zzz")))
+    (is (= ["a" "b"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest lrem-on-missing-key
+  (is (= 0 (run (ctx) "LREM" "nokey" "0" "a"))))
+
+(deftest lrem-emptying-list-deletes-key
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "a")
+    (is (= 2 (run c "LREM" "l" "0" "a")))
+    (is (= 0 (run c "EXISTS" "l")))))
+
+(deftest lrem-after-rebalance
+  (testing "front/back に分かれた状態でも正しく削除する"
+    (let [c (ctx)]
+      (run c "RPUSH" "l" "a" "b" "a" "c" "a" "d")
+      (run c "LPOP" "l")                      ; リバランスを起こす
+      (is (= 1 (run c "LREM" "l" "1" "a")))
+      (is (= ["b" "c" "a" "d"] (run c "LRANGE" "l" "0" "-1"))))))
+
+(deftest lrem-non-integer-count
+  (is (= "ERR value is not an integer or out of range"
+         (err-msg (run (ctx) "LREM" "l" "abc" "a")))))
+
+(deftest lrem-wrong-type
+  (let [c (ctx)]
+    (run c "SET" "s" "v")
+    (is (= "WRONGTYPE Operation against a key holding the wrong kind of value"
+           (err-msg (run c "LREM" "s" "0" "a"))))))
+
+;; ---------- LTRIM ----------
+
+(deftest ltrim-keeps-range
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c" "d" "e")
+    (is (= "OK" (:value (run c "LTRIM" "l" "1" "3"))))
+    (is (= ["b" "c" "d"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest ltrim-negative-indices
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c" "d" "e")
+    (run c "LTRIM" "l" "-2" "-1")
+    (is (= ["d" "e"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest ltrim-clamps-out-of-range
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c")
+    (run c "LTRIM" "l" "0" "999")
+    (is (= ["a" "b" "c"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest ltrim-empty-range-deletes-key
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c")
+    (is (= "OK" (:value (run c "LTRIM" "l" "5" "10"))))
+    (is (= 0 (run c "EXISTS" "l")))))
+
+(deftest ltrim-start-after-stop-deletes-key
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c")
+    (run c "LTRIM" "l" "2" "1")
+    (is (= 0 (run c "EXISTS" "l")))))
+
+(deftest ltrim-is-idempotent
+  (testing "同じ LTRIM を繰り返しても結果が変わらない"
+    (let [c (ctx)]
+      (run c "RPUSH" "l" "a" "b" "c" "d" "e")
+      (run c "LTRIM" "l" "0" "2")
+      (let [after-first (run c "LRANGE" "l" "0" "-1")]
+        (run c "LTRIM" "l" "0" "2")
+        (is (= after-first (run c "LRANGE" "l" "0" "-1")))))))
+
+(deftest ltrim-on-missing-key
+  (is (= "OK" (:value (run (ctx) "LTRIM" "nokey" "0" "10")))))
+
+(deftest ltrim-after-rebalance
+  (let [c (ctx)]
+    (run c "RPUSH" "l" "a" "b" "c" "d" "e" "f")
+    (run c "LPOP" "l")
+    (run c "RPOP" "l")
+    (run c "LTRIM" "l" "1" "2")
+    (is (= ["c" "d"] (run c "LRANGE" "l" "0" "-1")))))
+
+(deftest ltrim-non-integer-index
+  (is (= "ERR value is not an integer or out of range"
+         (err-msg (run (ctx) "LTRIM" "l" "a" "b")))))
+
+;; ---------- 直近N件ログのパターン ----------
+
+(deftest capped-log-pattern
+  (testing "LPUSH + LTRIM で直近N件だけ保持する"
+    (let [c (ctx)]
+      (dotimes [i 20]
+        (run c "LPUSH" "log" (str "entry-" i))
+        (run c "LTRIM" "log" "0" "4"))
+      (is (= 5 (run c "LLEN" "log")))
+      (is (= ["entry-19" "entry-18" "entry-17" "entry-16" "entry-15"]
+             (run c "LRANGE" "log" "0" "-1"))))))
+
 ;; ---------- Hash ----------
 
 (deftest hset-counts-new-fields-only

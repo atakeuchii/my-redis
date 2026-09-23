@@ -6,9 +6,9 @@
 (def ^:const max-level 32)
 (def ^:const p 0.25)
 
-(deftype Node [^double score ^String member ^objects forward ^longs span])
+(deftype Node [^double score ^String member ^objects forward ^longs span]) ;; forward: 次の要素(Node) / span: 次の要素までの間隔
 
-(deftype SkipList [^Node header ^longs state])
+(deftype SkipList [^Node header ^longs state]) ;; state: [最大level length]の配列
 
 (defn- new-node ^Node [^double s ^String m ^long lvl]
   (->Node s m (object-array lvl) (long-array lvl)))
@@ -53,46 +53,24 @@
       (recur (inc lvl))
       lvl)))
 
-(defn- predecessors
-  "各段で (s, m) の直前にあるノードを update[i] に記録し、最下段の直前ノードを返す。"
-  ^Node [^SkipList sl ^double s ^String m ^objects update]
-  (loop [i (dec (level sl))
-         x (.header sl)]
-    (if (neg? i)
-      x
-      (let [x (loop [^Node x x]
-                (let [nxt (next-at x i)]
-                  (if (and nxt (node-before? nxt s m))
-                    (recur nxt)
-                    x)))]
-        (aset update i x)
-        (recur (dec i) x)))))
-
 (defn- search-path [^SkipList sl ^double s ^String m]
   (let [^objects update (object-array max-level)
         ^longs rank (long-array max-level)
         top (dec (level sl))]
     (loop [i top
-           x (.header sl)]
+           ^Node x (.header sl)]
       (when-not (neg? i)
         (aset rank i (if (= i top) 0 (aget rank (inc i))))
-        (let [x (loop [^Node x x]
-                  (let [nxt (next-at x i)]
-                    (if (and nxt (node-before? nxt s m))
-                      (do (aset rank i (+ (aget rank i) (span-at x i)))
-                          (recur nxt))
-                      x)))]
+        (let [^Node x (loop [^Node x x]
+                        (let [nxt (next-at x i)]
+                          (if (and nxt (node-before? nxt s m))
+                            (do (aset rank i (+ (aget rank i) (span-at x i)))
+                                (recur nxt))
+                            x)))]
           (aset update i x)
           (recur (dec i) x))))
     [update rank]))
 
-;; (defn find-node
-;;   "(s, m) のノードを返す。無ければ nil。"
-;;   ^Node [^SkipList sl ^double s ^String m]
-;;   (let [x (predecessors sl s m (object-array max-level))
-;;         cand (next-at x 0)]
-;;     (when (and cand (== (.score cand) s) (= (.member cand) m))
-;;       cand)))
 (defn find-node
   "(s, m) のノードを返す。無ければ nil。"
   ^Node [^SkipList sl ^double s ^String m]
