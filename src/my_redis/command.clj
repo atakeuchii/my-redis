@@ -3,7 +3,8 @@
             [my-redis.resp :as resp]
             [my-redis.db :as db]
             [my-redis.types.list :as dlist]
-            [my-redis.types.zset :as zset]))
+            [my-redis.types.zset :as zset])
+  (:import [java.util.regex Pattern]))
 
 ;; ---------- ハンドラ ----------
 ;; シグネチャ: (fn [ctx args] -> reply)
@@ -135,14 +136,14 @@
           \? (do (.append sb ".")  (recur (next chars)))
           \[ (let [[cls rest] (split-with #(not= % \]) (next chars))]
                (.append sb "[")
-               (doseq [ch cls] (.append sb (java.util.regex.Pattern/quote (str ch))))
+               (doseq [ch cls] (.append sb (Pattern/quote (str ch))))
                (.append sb "]")
                (recur (next rest)))
           \\ (if-let [nxt (second chars)]
-               (do (.append sb (java.util.regex.Pattern/quote (str nxt)))
+               (do (.append sb (Pattern/quote (str nxt)))
                    (recur (nnext chars)))
                (do (.append sb "\\\\") (recur (next chars))))
-          (do (.append sb (java.util.regex.Pattern/quote (str c)))
+          (do (.append sb (Pattern/quote (str c)))
               (recur (next chars))))))
     (re-pattern (str "^" sb "$"))))
 
@@ -351,6 +352,23 @@
                         :else
                         [(dlist/assoc-nth l idx v) (resp/simple "OK")]))))
     not-integer-error))
+
+(defn- cmd-lrem [ctx [k cnt v]]
+  (if-let [n (parse-long-or-nil cnt)]
+    (list-update! ctx k (fn [l] (dlist/remove-value l v n)))
+    not-integer-error))
+
+(defn- cmd-ltrim [ctx [k start stop]]
+  (let [s (parse-long-or-nil start)
+        e (parse-long-or-nil stop)]
+    (if (or (nil? s) (nil? e))
+      not-integer-error
+      (list-update! ctx k
+                    (fn [l]
+                      (let [next (if-let [[from to] (clamp-range s e (dlist/count l))]
+                                   (dlist/from-seq (dlist/subrange l from to))
+                                   dlist/empty-list)]
+                        [next (resp/simple "OK")]))))))
 
 (defn- hash-update! [ctx k f]
   (let [outcome (atom nil)]
@@ -734,6 +752,8 @@
    "LRANGE" {:arity  4 :write? false :handler cmd-lrange}
    "LINDEX" {:arity  3 :write? false :handler cmd-lindex}
    "LSET"   {:arity  4 :write? true  :handler cmd-lset}
+   "LREM"   {:arity 4 :write? true :handler cmd-lrem}
+   "LTRIM"  {:arity 4 :write? true :handler cmd-ltrim}
 
    "HSET"     {:arity -4 :write? true  :handler cmd-hset}
    "HGET"     {:arity  3 :write? false :handler cmd-hget}
