@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [my-redis.command :as command]
             [my-redis.db :as db]
+            [my-redis.executor :as executor]
             [my-redis.resp :as resp]))
 
 (defn- ctx [] {:db (db/create)})
@@ -1212,11 +1213,23 @@
     (is (= "zset" (:value (run c "TYPE" "z"))))
     (is (= "skiplist" (:value (run c "OBJECT" "ENCODING" "z"))))))
 
-(deftest ^:skip concurrent-zincrby-is-atomic
-  (let [c (ctx)]
-    (->> (range 20)
-         (map (fn [_] (future (dotimes [_ 100]
-                                (command/dispatch c ["ZINCRBY" "z" "1" "m"])))))
-         doall
-         (run! deref))
-    (is (= "2000" (run c "ZSCORE" "z" "m")))))
+(deftest concurrent-zincrby-is-atomic
+  (testing "直接command/dispatchを実行すると並列処理のため値が消える"
+    (let [c (ctx)]
+      (->> (range 20)
+           (map (fn [_] (future (dotimes [_ 100]
+                                  (command/dispatch c ["ZINCRBY" "z" "1" "m"])))))
+           doall
+           (run! deref))
+      (is (> 2000 (parse-long (run c "ZSCORE" "z" "m"))))))
+  (testing "executor 経由なら直列化されるので値が失われない"
+    (let [c  (ctx)
+          ex (executor/start! (fn [cmd] (command/dispatch c cmd)))]
+      (try
+        (->> (range 20)
+             (map (fn [_] (future (dotimes [_ 100]
+                                    (executor/submit! ex ["ZINCRBY" "z" "1" "m"])))))
+             doall
+             (run! deref))
+        (is (= "2000" (run c "ZSCORE" "z" "m")))
+        (finally (executor/stop! ex))))))

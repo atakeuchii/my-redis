@@ -104,8 +104,8 @@
 
              :else
              (do (reset! outcome (resp/simple "OK"))
-                 (cond-> (db/entry :string v)
-                   ttl (assoc :expire-at (+ (db/now) ttl)))))))
+                 (assoc (db/entry :string v)
+                        :expire-at (when ttl (+ (db/now) ttl)))))))
         @outcome))))
 
 (defn- cmd-get [ctx [k]]
@@ -717,6 +717,53 @@
                (when-let [r (zset/rank z m)]
                  (- (zset/card z) 1 r)))))
 
+(defn- expire-with! [ctx k delta-ms]
+  (if (db/set-expire! (:db ctx) k (+ (db/now) delta-ms))
+    1
+    0))
+
+(defn- cmd-expire [ctx [k secs]]
+  (if-let [n (parse-long-or-nil secs)]
+    (expire-with! ctx k (* n 1000))
+    not-integer-error))
+
+(defn- cmd-pexpire [ctx [k ms]]
+  (if-let [n (parse-long-or-nil ms)]
+    (expire-with! ctx k n)
+    not-integer-error))
+
+(defn- cmd-expireat [ctx [k secs]]
+  (if-let [n (parse-long-or-nil secs)]
+    (if (db/set-expire! (:db ctx) k (* n 1000)) 1 0)
+    not-integer-error))
+
+(defn- cmd-pexpireat [ctx [k ms]]
+  (if-let [n (parse-long-or-nil ms)]
+    (if (db/set-expire! (:db ctx) k n) 1 0)
+    not-integer-error))
+
+(defn- ttl-in
+  "TTL / PTTL の共通処理。unit-div で秒かミリ秒かを切り替える。"
+  [ctx k ^long unit-div]
+  (let [d (:db ctx)]
+    (cond
+      (not (db/exists? d k)) -2
+      :else (if-let [exp (db/expired-at d k)]
+              (let [remain (- (long exp) (db/now))]
+                (if (= unit-div 1)
+                  remain
+                  (quot (+ remain 999) 1000)))
+              -1))))
+
+(defn- cmd-ttl [ctx [k]]
+  (ttl-in ctx k 1000))
+
+(defn- cmd-pttl [ctx [k]]
+  (ttl-in ctx k 1))
+
+(defn- cmd-persist [ctx [k]]
+  (if (db/persist! (:db ctx) k) 1 0))
+
 (def command-table
   {"PING"    {:arity -1 :write? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :handler cmd-echo}
@@ -787,6 +834,14 @@
    "ZRANK"         {:arity 3 :write? false :handler cmd-zrank}
    "ZREVRANK"      {:arity 3 :write? false :handler cmd-zrevrank}
 
+   "EXPIRE"    {:arity 3 :write? true  :handler cmd-expire}
+   "PEXPIRE"   {:arity 3 :write? true  :handler cmd-pexpire}
+   "EXPIREAT"  {:arity 3 :write? true  :handler cmd-expireat}
+   "PEXPIREAT" {:arity 3 :write? true  :handler cmd-pexpireat}
+   "TTL"       {:arity 2 :write? false :handler cmd-ttl}
+   "PTTL"      {:arity 2 :write? false :handler cmd-pttl}
+   "PERSIST"   {:arity 2 :write? true  :handler cmd-persist}
+
    "OBJECT" {:arity -2 :write? false :handler cmd-object}})
 
 (defn- arity-ok?
@@ -797,8 +852,14 @@
 
 (defn dispatch
   [ctx cmd]
-  (if-not (seq cmd)
+  (cond
+   (= cmd [:expire-cycle])
+    (db/expire-cycle! (:db ctx) 1)
+
+    (not (seq cmd))
     :no-reply
+
+    :else
     (let [raw (first cmd)
           name (str/upper-case raw)
           spec (get command-table name)]
