@@ -2,6 +2,7 @@
   (:require [my-redis.command :as command]
             [my-redis.db :as db]
             [my-redis.executor :as executor]
+            [my-redis.expiry :as expiry]
             [my-redis.resp :as resp])
   (:import [java.net ServerSocket Socket SocketException]
            [java.io BufferedInputStream BufferedOutputStream EOFException]))
@@ -41,37 +42,42 @@
         (catch Exception _ nil)))))
 
 (defn start!
-  [port]
-  (let [socket (ServerSocket. port)
-        actual-port (.getLocalPort socket)
-        keyspace (db/create)
-        ctx {:db keyspace}
-        ex (executor/start! (fn [cmd] (command/dispatch ctx cmd)))
-        state (atom {:socket socket
-                     :port actual-port
-                     :running? true
-                     :connections #{}
-                     :db keyspace
-                     :executor ex})]
-    (future
-      (try
-        (println (format "[server] listening on %d" actual-port))
-        (loop []
-          (let [sock (.accept socket)]
-            (future (serve-connection! state sock))
-            (recur)))
-        (catch SocketException e
-          (if (:running? @state)
-            (println "[server] accept error:" (.getMessage e))
-            (println "[server] stopped")))
-        (catch Exception e
-          (println "[server] fatal:" (.getMessage e)))))
-    state))
+  ([port] (start! port {}))
+  ([port {:keys [expire-interval-ms] :or {expire-interval-ms 100}}]
+   (let [socket (ServerSocket. port)
+         actual-port (.getLocalPort socket)
+         keyspace (db/create)
+         ctx {:db keyspace}
+         ex (executor/start! (fn [cmd] (command/dispatch ctx cmd)))
+         cycler (expiry/start! (fn [] (executor/submit! ex [:expire-cycle]))
+                               {:interval-ms expire-interval-ms})
+         state (atom {:socket socket
+                      :port actual-port
+                      :running? true
+                      :connections #{}
+                      :db keyspace
+                      :executor ex
+                      :expiry cycler})]
+     (future
+       (try
+         (println (format "[server] listening on %d" actual-port))
+         (loop []
+           (let [sock (.accept socket)]
+             (future (serve-connection! state sock))
+             (recur)))
+         (catch SocketException e
+           (if (:running? @state)
+             (println "[server] accept error:" (.getMessage e))
+             (println "[server] stopped")))
+         (catch Exception e
+           (println "[server] fatal:" (.getMessage e)))))
+     state)))
 
 (defn stop!
   [state]
   (swap! state assoc :running? false)
-  (let [{:keys [^ServerSocket socket connections executor]} @state]
+  (let [{:keys [^ServerSocket socket connections executor expiry]} @state]
+    (expiry/stop! expiry)
     (doseq [^Socket c connections]
       (try
         (.close c)
