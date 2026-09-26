@@ -38,7 +38,7 @@
   "テスト用サーバを起動し、body を実行して必ず停止する。
    port には OS が割り当てた実際のポート番号が束縛される。"
   [[port] & body]
-  `(let [srv# (server/start! 0)
+  `(let [srv# (server/start! 0 {:verbose? false})
          ~port (:port @srv#)]
      (try
        ~@body
@@ -141,7 +141,7 @@
 
 (deftest connections-are-released
   (testing "切断された接続がレジストリから除かれる"
-    (let [srv  (server/start! 0)
+    (let [srv  (server/start! 0 {:verbose? false})
           port (:port @srv)]
       (try
         (let [conns (repeatedly 3 #(connect port))]
@@ -154,7 +154,7 @@
 
 (deftest stop-closes-existing-connections
   (testing "stop! は既存接続も切る"
-    (let [srv  (server/start! 0)
+    (let [srv  (server/start! 0 {:verbose? false})
           port (:port @srv)
           conn (connect port)]
       (is (= "PONG" (send-cmd! conn ["PING"])))
@@ -166,7 +166,7 @@
 
 (deftest stop-refuses-new-connections
   (testing "stop! の後は新規接続を受け付けない"
-    (let [srv  (server/start! 0)
+    (let [srv  (server/start! 0 {:verbose? false})
           port (:port @srv)]
       (is (= "PONG" (one-shot port ["PING"])))
       (server/stop! srv)

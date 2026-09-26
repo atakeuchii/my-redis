@@ -764,9 +764,6 @@
 (defn- cmd-persist [ctx [k]]
   (if (db/persist! (:db ctx) k) 1 0))
 
-(defn- cmd-expire-cycle [ctx _args]
-  (db/expire-cycle-full! (:db ctx)))
-
 (def command-table
   {"PING"    {:arity -1 :write? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :handler cmd-echo}

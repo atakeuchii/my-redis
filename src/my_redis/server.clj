@@ -25,7 +25,7 @@
             (= reply :quit)
             (do (resp/write-reply! out (resp/simple "OK"))
                 (.flush out))
-            
+
             :else
             (do (resp/write-reply! out reply)
                 (.flush out)
@@ -43,7 +43,8 @@
 
 (defn start!
   ([port] (start! port {}))
-  ([port {:keys [expire-interval-ms] :or {expire-interval-ms 100}}]
+  ([port {:keys [expire-interval-ms verbose?]
+          :or {expire-interval-ms 100 verbose? true}}]
    (let [socket (ServerSocket. port)
          actual-port (.getLocalPort socket)
          keyspace (db/create)
@@ -57,26 +58,29 @@
                       :connections #{}
                       :db keyspace
                       :executor ex
-                      :expiry cycler})]
+                      :expiry cycler
+                      :verbose? verbose?})
+         log (fn [& args] (when verbose? (apply println args)))]
      (future
        (try
-         (println (format "[server] listening on %d" actual-port))
+         (log (format "[server] listening on %d" actual-port))
          (loop []
            (let [sock (.accept socket)]
              (future (serve-connection! state sock))
              (recur)))
          (catch SocketException e
            (if (:running? @state)
-             (println "[server] accept error:" (.getMessage e))
-             (println "[server] stopped")))
+             (log "[server] accept error:" (.getMessage e))
+             (log "[server] stopped")))
          (catch Exception e
-           (println "[server] fatal:" (.getMessage e)))))
+           (log "[server] fatal:" (.getMessage e)))))
      state)))
 
 (defn stop!
   [state]
   (swap! state assoc :running? false)
-  (let [{:keys [^ServerSocket socket connections executor expiry]} @state]
+  (let [{:keys [^ServerSocket socket connections executor expiry verbose?]} @state
+        log (fn [& args] (when verbose? (apply println args)))]
     (expiry/stop! expiry)
     (doseq [^Socket c connections]
       (try
@@ -85,6 +89,6 @@
     (try
       (.close socket)
       (catch Exception _ nil))
-    (executor/stop! executor))
-  (println "[server] stop requested")
+    (executor/stop! executor)
+    (log "[server] stop requested"))
   nil)

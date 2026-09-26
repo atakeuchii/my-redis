@@ -148,11 +148,11 @@
                              (when (some? next)
                                (entry type next)))))))
 
-(defn set-expire! [db k ^long expired-at]
+(defn set-expire! [db k ^long expire-at]
   (if (get-entry db k)
     (do (swap! db (fn [s]
                     (-> s
-                        (assoc-in [k :expire-at] expired-at)
+                        (assoc-in [:data k :expire-at] expire-at)
                         (update :expires conj k))))
         true)
     false))
