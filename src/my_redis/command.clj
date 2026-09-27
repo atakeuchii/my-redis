@@ -2,6 +2,7 @@
   (:require [clojure.string :as str]
             [my-redis.resp :as resp]
             [my-redis.db :as db]
+            [my-redis.config :as config]
             [my-redis.types.list :as dlist]
             [my-redis.types.zset :as zset])
   (:import [java.util.regex Pattern]))
@@ -764,6 +765,40 @@
 (defn- cmd-persist [ctx [k]]
   (if (db/persist! (:db ctx) k) 1 0))
 
+(defn- cmd-config [ctx [subcmd & args]]
+  (let [sub (str/upper-case (or subcmd ""))
+        cfg (:config ctx)]
+    (case sub
+      "GET"
+      (if (= 1 (count args))
+        (let [re (glob->regex (first args))]
+          (config/matching cfg #(re-matches re %)))
+        (resp/error "ERR wrong number of arguments for 'config|get' command"))
+
+      "SET"
+      (if (= 2 (count args))
+        (let [[k v] args]
+          (cond
+            (not (config/known? cfg k))
+            (resp/error (str "ERR Unknown option or number of arguments for CONFIG SET - '" k "'"))
+
+            (and (= k "maxmemory-policy") (not (config/valid-policies v)))
+            (resp/error "ERR CONFIG SET failed - argument couldn't be parsed into an integer")
+
+            (and (#{"maxkeys" "maxmemory-samples"} k) (nil? (parse-long-or-nil v)))
+            (resp/error "ERR CONFIG SET failed - argument couldn't be parsed into an integer")
+
+            :else
+            (do (config/set-raw! cfg k v)
+                (resp/simple "OK"))))
+        (resp/error "ERR wrong number of arguments for 'config|set' command"))
+
+      "RESETSTAT"
+      (resp/simple "OK")
+
+      (resp/error (str "ERR Unknown CONFIG subcommand or wrong number of arguments for '"
+                       subcmd "'")))))
+
 (def command-table
   {"PING"    {:arity -1 :write? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :handler cmd-echo}
@@ -784,10 +819,10 @@
    "INCRBY"  {:arity  3 :write? true  :handler cmd-incrby}
    "DECRBY"  {:arity  3 :write? true  :handler cmd-decrby}
 
-   "APPEND" {:arity 3 :write? true  :handler cmd-append}
-   "STRLEN" {:arity 2 :write? false :handler cmd-strlen}
-   "GETSET" {:arity 3 :write? true  :handler cmd-getset}
-   "SETNX"  {:arity 3 :write? true  :handler cmd-setnx}
+   "APPEND" {:arity  3 :write? true  :handler cmd-append}
+   "STRLEN" {:arity  2 :write? false :handler cmd-strlen}
+   "GETSET" {:arity  3 :write? true  :handler cmd-getset}
+   "SETNX"  {:arity  3 :write? true  :handler cmd-setnx}
    "MSET"   {:arity -3 :write? true  :handler cmd-mset}
    "MGET"   {:arity -2 :write? false :handler cmd-mget}
 
@@ -799,8 +834,8 @@
    "LRANGE" {:arity  4 :write? false :handler cmd-lrange}
    "LINDEX" {:arity  3 :write? false :handler cmd-lindex}
    "LSET"   {:arity  4 :write? true  :handler cmd-lset}
-   "LREM"   {:arity 4 :write? true :handler cmd-lrem}
-   "LTRIM"  {:arity 4 :write? true :handler cmd-ltrim}
+   "LREM"   {:arity  4 :write? true  :handler cmd-lrem}
+   "LTRIM"  {:arity  4 :write? true  :handler cmd-ltrim}
 
    "HSET"     {:arity -4 :write? true  :handler cmd-hset}
    "HGET"     {:arity  3 :write? false :handler cmd-hget}
@@ -842,7 +877,8 @@
    "PTTL"      {:arity 2 :write? false :handler cmd-pttl}
    "PERSIST"   {:arity 2 :write? true  :handler cmd-persist}
 
-   "OBJECT" {:arity -2 :write? false :handler cmd-object}})
+   "OBJECT" {:arity -2 :write? false :handler cmd-object}
+   "CONFIG" {:arity -2 :write? false :denyoom? false :handler cmd-config}})
 
 (defn- arity-ok?
   [^long arity ^long n]

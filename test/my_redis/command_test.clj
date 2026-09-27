@@ -1,11 +1,12 @@
 (ns my-redis.command-test
   (:require [clojure.test :refer [deftest is testing]]
             [my-redis.command :as command]
+            [my-redis.config :as config]
             [my-redis.db :as db]
             [my-redis.executor :as executor]
             [my-redis.resp :as resp]))
 
-(defn- ctx [] {:db (db/create)})
+(defn- ctx [] {:db (db/create) :config (config/create)})
 
 (defn- run
   "コマンドを実行して応答を返す。"

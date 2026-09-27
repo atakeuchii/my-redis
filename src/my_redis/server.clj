@@ -1,6 +1,7 @@
 (ns my-redis.server
-  (:require [my-redis.command :as command]
-            [my-redis.db :as db]
+  (:require [my-redis.db :as db]
+            [my-redis.command :as command]
+            [my-redis.config :as config]
             [my-redis.executor :as executor]
             [my-redis.expiry :as expiry]
             [my-redis.resp :as resp])
@@ -48,7 +49,9 @@
    (let [socket (ServerSocket. port)
          actual-port (.getLocalPort socket)
          keyspace (db/create)
-         ctx {:db keyspace}
+         cfg (config/create)
+         ctx {:db keyspace
+              :config cfg}
          ex (executor/start! (fn [cmd] (command/dispatch ctx cmd)))
          cycler (expiry/start! (fn [] (executor/submit! ex [:expire-cycle]))
                                {:interval-ms expire-interval-ms})
@@ -59,7 +62,8 @@
                       :db keyspace
                       :executor ex
                       :expiry cycler
-                      :verbose? verbose?})
+                      :verbose? verbose?
+                      :config cfg})
          log (fn [& args] (when verbose? (apply println args)))]
      (future
        (try
