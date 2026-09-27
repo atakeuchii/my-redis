@@ -8,7 +8,7 @@
   []
   (System/currentTimeMillis))
 
-(defn create 
+(defn create
   []
   (atom {:data {} :expires #{}}))
 
@@ -64,22 +64,25 @@
     (disj expires k)))
 
 (defn set-entry! [db k entry]
-  (swap! db (fn [s]
-              (-> s
-                  (assoc-in [:data k] entry)
-                  (update :expires reindex-expires k entry))))
-  nil)
+  (let [entry (assoc entry :atime (now))]
+    (swap! db (fn [s]
+                (-> s
+                    (assoc-in [:data k] entry)
+                    (update :expires reindex-expires k entry))))
+    nil))
 
 (defn set-value! [db k type value]
   (set-entry! db k (entry type value))
   nil)
 
 (defn set-entries! [db entries]
-  (swap! db (fn [s]
-              (-> s
-                  (update :data merge entries)
-                  (update :expires #(reduce-kv reindex-expires % entries)))))
-  nil)
+  (let [t (now)
+        entries (into {} (map (fn [[k e]] [k (assoc e :atime t)])) entries)]
+    (swap! db (fn [s]
+                (-> s
+                    (update :data merge entries)
+                    (update :expires #(reduce-kv reindex-expires % entries)))))
+    nil))
 
 (defn delete! [db k]
   (let [[old _] (swap-vals! db (fn [s]
@@ -103,9 +106,14 @@
 (defn wrong-type? [x]
   (= x wrong-type))
 
-(defn fetch-typed
-  [db k type]
-  (let [e (get-entry db k)]
+(defn touch-entry! [db k]
+  (when-let [e (reap! db k)]
+    (let [t (now)]
+      (swap! db assoc-in [:data k :atime] t)
+      (assoc e :atime t))))
+
+(defn fetch-typed [db k type]
+  (let [e (touch-entry! db k)]
     (cond
       (nil? e) nil
       (= type (:type e)) e
@@ -114,7 +122,7 @@
 (defn typed-value
   [db k type default]
   (let [e (fetch-typed db k type)]
-    (cond 
+    (cond
       (wrong-type? e) wrong-type
       (nil? e) default
       :else (:value e))))
@@ -134,7 +142,8 @@
                                                  (and (:expire-at cur) (not (contains? next :expire-at)))
                                                  (assoc next :expire-at (:expire-at cur))
 
-                                                 :else next)]
+                                                 :else next)
+                                          next (when next (assoc next :atime t))]
                                       (if (nil? next)
                                         (-> s (update :data dissoc k) (update :expires disj k))
                                         (-> s (assoc-in [:data k] next) (update :expires reindex-expires k next))))))]
@@ -174,17 +183,27 @@
 (defn expires-count ^long [db]
   (count (:expires @db)))
 
-;; (defn expire-cycle-full!
-;;   [db]
-;;   (let [t (now)
-;;         [old new] (swap-vals! db
-;;                               (fn [m]
-;;                                 (persistent!
-;;                                  (reduce-kv (fn [acc k e]
-;;                                               (if (expired? e t) (dissoc! acc k) acc))
-;;                                             (transient m)
-;;                                             m))))]
-;;     (- (count old) (count new))))
+(defn key-count ^long [db]
+  (count (data db)))
+
+(defn all-keys-vec [db]
+  (vec (clojure.core/keys (data db))))
+
+(defn volatile-keys-vec [db]
+  (vec (:expires @db)))
+
+(defn oldest-key [db ks]
+  (let [d (data db)
+        target (if ks (select-keys d ks) d)]
+    (when (seq target)
+      (key (apply min-key (fn [[_ e]] (or (:atime e) 0)) target)))))
+
+(defn evict! [db k]
+  (swap! db (fn [s]
+              (-> s
+                  (update :data dissoc k)
+                  (update :expires disj k))))
+  nil)
 
 ;; ---------- 能動的期限切れ ----------
 

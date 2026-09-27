@@ -4,6 +4,7 @@
             [my-redis.db :as db]
             [my-redis.config :as config]
             [my-redis.types.list :as dlist]
+            [my-redis.eviction :as eviction]
             [my-redis.types.zset :as zset])
   (:import [java.util.regex Pattern]))
 
@@ -27,6 +28,9 @@
 
 (def ^:private min-max-error
   (resp/error "ERR min or max is not a float"))
+
+(def ^:private oom-error
+  (resp/error "OOM command not allowed when used memory > 'maxmemory'."))
 
 (defn- byte-length ^long [^String s]
   (alength (.getBytes s "UTF-8")))
@@ -800,96 +804,92 @@
                        subcmd "'")))))
 
 (def command-table
-  {"PING"    {:arity -1 :write? false :handler cmd-ping}
-   "ECHO"    {:arity  2 :write? false :handler cmd-echo}
-   "COMMAND" {:arity -1 :write? false :handler cmd-command}
-   "QUIT"    {:arity  1 :write? false :handler cmd-quit}
+  {"PING"    {:arity -1 :write? false :denyoom? false :handler cmd-ping}
+   "ECHO"    {:arity  2 :write? false :denyoom? false :handler cmd-echo}
+   "COMMAND" {:arity -1 :write? false :denyoom? false :handler cmd-command}
+   "QUIT"    {:arity  1 :write? false :denyoom? false :handler cmd-quit}
+   "CONFIG"  {:arity -2 :write? false :denyoom? false :handler cmd-config}
+   "DBSIZE"  {:arity  1 :write? false :denyoom? false :handler cmd-dbsize}
+   "FLUSHDB" {:arity -1 :write? true  :denyoom? false :handler cmd-flushdb}
+   "OBJECT"  {:arity -2 :write? false :denyoom? false :handler cmd-object}
 
-   "SET"     {:arity -3 :write? true  :handler cmd-set}
-   "GET"     {:arity  2 :write? false :handler cmd-get}
-   "DEL"     {:arity -2 :write? true  :handler cmd-del}
-   "EXISTS"  {:arity -2 :write? false :handler cmd-exists}
-   "TYPE"    {:arity  2 :write? false :handler cmd-type}
-   "KEYS"    {:arity  2 :write? false :handler cmd-keys}
-   "FLUSHDB" {:arity -1 :write? true  :handler cmd-flushdb}
+   "DEL"     {:arity -2 :write? true  :denyoom? false :handler cmd-del}
+   "EXISTS"  {:arity -2 :write? false :denyoom? false :handler cmd-exists}
+   "TYPE"    {:arity  2 :write? false :denyoom? false :handler cmd-type}
+   "KEYS"    {:arity  2 :write? false :denyoom? false :handler cmd-keys}
 
-   "DBSIZE"  {:arity  1 :write? false :handler cmd-dbsize}
-   "INCR"    {:arity  2 :write? true  :handler cmd-incr}
-   "DECR"    {:arity  2 :write? true  :handler cmd-decr}
-   "INCRBY"  {:arity  3 :write? true  :handler cmd-incrby}
-   "DECRBY"  {:arity  3 :write? true  :handler cmd-decrby}
+   "SET"     {:arity -3 :write? true  :denyoom? true  :handler cmd-set}
+   "GET"     {:arity  2 :write? false :denyoom? false :handler cmd-get}
+   "SETNX"   {:arity  3 :write? true  :denyoom? true  :handler cmd-setnx}
+   "GETSET"  {:arity  3 :write? true  :denyoom? true  :handler cmd-getset}
+   "APPEND"  {:arity  3 :write? true  :denyoom? true  :handler cmd-append}
+   "STRLEN"  {:arity  2 :write? false :denyoom? false :handler cmd-strlen}
+   "INCR"    {:arity  2 :write? true  :denyoom? true  :handler cmd-incr}
+   "DECR"    {:arity  2 :write? true  :denyoom? true  :handler cmd-decr}
+   "INCRBY"  {:arity  3 :write? true  :denyoom? true  :handler cmd-incrby}
+   "DECRBY"  {:arity  3 :write? true  :denyoom? true  :handler cmd-decrby}
+   "MSET"    {:arity -3 :write? true  :denyoom? true  :handler cmd-mset}
+   "MGET"    {:arity -2 :write? false :denyoom? false :handler cmd-mget}
 
-   "APPEND" {:arity  3 :write? true  :handler cmd-append}
-   "STRLEN" {:arity  2 :write? false :handler cmd-strlen}
-   "GETSET" {:arity  3 :write? true  :handler cmd-getset}
-   "SETNX"  {:arity  3 :write? true  :handler cmd-setnx}
-   "MSET"   {:arity -3 :write? true  :handler cmd-mset}
-   "MGET"   {:arity -2 :write? false :handler cmd-mget}
+   "RPUSH"  {:arity -3 :write? true  :denyoom? true  :handler cmd-rpush}
+   "LPUSH"  {:arity -3 :write? true  :denyoom? true  :handler cmd-lpush}
+   "RPOP"   {:arity  2 :write? true  :denyoom? false :handler cmd-rpop}
+   "LPOP"   {:arity  2 :write? true  :denyoom? false :handler cmd-lpop}
+   "LLEN"   {:arity  2 :write? false :denyoom? false :handler cmd-llen}
+   "LRANGE" {:arity  4 :write? false :denyoom? false :handler cmd-lrange}
+   "LINDEX" {:arity  3 :write? false :denyoom? false :handler cmd-lindex}
+   "LSET"   {:arity  4 :write? true  :denyoom? true  :handler cmd-lset}
+   "LREM"   {:arity  4 :write? true  :denyoom? false :handler cmd-lrem}
+   "LTRIM"  {:arity  4 :write? true  :denyoom? false :handler cmd-ltrim}
 
-   "RPUSH"  {:arity -3 :write? true  :handler cmd-rpush}
-   "LPUSH"  {:arity -3 :write? true  :handler cmd-lpush}
-   "RPOP"   {:arity  2 :write? true  :handler cmd-rpop}
-   "LPOP"   {:arity  2 :write? true  :handler cmd-lpop}
-   "LLEN"   {:arity  2 :write? false :handler cmd-llen}
-   "LRANGE" {:arity  4 :write? false :handler cmd-lrange}
-   "LINDEX" {:arity  3 :write? false :handler cmd-lindex}
-   "LSET"   {:arity  4 :write? true  :handler cmd-lset}
-   "LREM"   {:arity  4 :write? true  :handler cmd-lrem}
-   "LTRIM"  {:arity  4 :write? true  :handler cmd-ltrim}
+   "HSET"     {:arity -4 :write? true  :denyoom? true  :handler cmd-hset}
+   "HGET"     {:arity  3 :write? false :denyoom? false :handler cmd-hget}
+   "HDEL"     {:arity -3 :write? true  :denyoom? false :handler cmd-hdel}
+   "HGETALL"  {:arity  2 :write? false :denyoom? false :handler cmd-hgetall}
+   "HKEYS"    {:arity  2 :write? false :denyoom? false :handler cmd-hkeys}
+   "HVALS"    {:arity  2 :write? false :denyoom? false :handler cmd-hvals}
+   "HLEN"     {:arity  2 :write? false :denyoom? false :handler cmd-hlen}
+   "HEXISTS"  {:arity  3 :write? false :denyoom? false :handler cmd-hexists}
+   "HINCRBY"  {:arity  4 :write? true  :denyoom? true  :handler cmd-hincrby}
 
-   "HSET"     {:arity -4 :write? true  :handler cmd-hset}
-   "HGET"     {:arity  3 :write? false :handler cmd-hget}
-   "HDEL"     {:arity -3 :write? true  :handler cmd-hdel}
-   "HGETALL"  {:arity  2 :write? false :handler cmd-hgetall}
-   "HKEYS"    {:arity  2 :write? false :handler cmd-hkeys}
-   "HVALS"    {:arity  2 :write? false :handler cmd-hvals}
-   "HLEN"     {:arity  2 :write? false :handler cmd-hlen}
-   "HEXISTS"  {:arity  3 :write? false :handler cmd-hexists}
-   "HINCRBY"  {:arity  4 :write? true  :handler cmd-hincrby}
+   "SADD"      {:arity -3 :write? true  :denyoom? true  :handler cmd-sadd}
+   "SREM"      {:arity -3 :write? true  :denyoom? false :handler cmd-srem}
+   "SMEMBERS"  {:arity  2 :write? false :denyoom? false :handler cmd-smembers}
+   "SISMEMBER" {:arity  3 :write? false :denyoom? false :handler cmd-sismember}
+   "SCARD"     {:arity  2 :write? false :denyoom? false :handler cmd-scard}
+   "SPOP"      {:arity  2 :write? true  :denyoom? false :handler cmd-spop}
+   "SINTER"    {:arity -2 :write? false :denyoom? false :handler cmd-sinter}
+   "SUNION"    {:arity -2 :write? false :denyoom? false :handler cmd-sunion}
+   "SDIFF"     {:arity -2 :write? false :denyoom? false :handler cmd-sdiff}
 
-   "SADD"      {:arity -3 :write? true  :handler cmd-sadd}
-   "SREM"      {:arity -3 :write? true  :handler cmd-srem}
-   "SMEMBERS"  {:arity  2 :write? false :handler cmd-smembers}
-   "SISMEMBER" {:arity  3 :write? false :handler cmd-sismember}
-   "SCARD"     {:arity  2 :write? false :handler cmd-scard}
-   "SPOP"      {:arity  2 :write? true  :handler cmd-spop}
-   "SINTER"    {:arity -2 :write? false :handler cmd-sinter}
-   "SUNION"    {:arity -2 :write? false :handler cmd-sunion}
-   "SDIFF"     {:arity -2 :write? false :handler cmd-sdiff}
+   "ZADD"          {:arity -4 :write? true  :denyoom? true  :handler cmd-zadd}
+   "ZSCORE"        {:arity  3 :write? false :denyoom? false :handler cmd-zscore}
+   "ZCARD"         {:arity  2 :write? false :denyoom? false :handler cmd-zcard}
+   "ZREM"          {:arity -3 :write? true  :denyoom? false :handler cmd-zrem}
+   "ZINCRBY"       {:arity  4 :write? true  :denyoom? true  :handler cmd-zincrby}
+   "ZRANGE"        {:arity -4 :write? false :denyoom? false :handler cmd-zrange}
+   "ZREVRANGE"     {:arity -4 :write? false :denyoom? false :handler cmd-zrevrange}
+   "ZRANGEBYSCORE" {:arity -4 :write? false :denyoom? false :handler cmd-zrangebyscore}
+   "ZCOUNT"        {:arity  4 :write? false :denyoom? false :handler cmd-zcount}
+   "ZRANK"         {:arity 3 :write? false :denyoom? false :handler cmd-zrank}
+   "ZREVRANK"      {:arity 3 :write? false :denyoom? false :handler cmd-zrevrank}
 
-   "ZADD"          {:arity -4 :write? true  :handler cmd-zadd}
-   "ZSCORE"        {:arity  3 :write? false :handler cmd-zscore}
-   "ZCARD"         {:arity  2 :write? false :handler cmd-zcard}
-   "ZREM"          {:arity -3 :write? true  :handler cmd-zrem}
-   "ZINCRBY"       {:arity  4 :write? true  :handler cmd-zincrby}
-   "ZRANGE"        {:arity -4 :write? false :handler cmd-zrange}
-   "ZREVRANGE"     {:arity -4 :write? false :handler cmd-zrevrange}
-   "ZRANGEBYSCORE" {:arity -4 :write? false :handler cmd-zrangebyscore}
-   "ZCOUNT"        {:arity  4 :write? false :handler cmd-zcount}
-   "ZRANK"         {:arity 3 :write? false :handler cmd-zrank}
-   "ZREVRANK"      {:arity 3 :write? false :handler cmd-zrevrank}
+   "EXPIRE"    {:arity 3 :write? true  :denyoom? false :handler cmd-expire}
+   "PEXPIRE"   {:arity 3 :write? true  :denyoom? false :handler cmd-pexpire}
+   "EXPIREAT"  {:arity 3 :write? true  :denyoom? false :handler cmd-expireat}
+   "PEXPIREAT" {:arity 3 :write? true  :denyoom? false :handler cmd-pexpireat}
+   "TTL"       {:arity 2 :write? false :denyoom? false :handler cmd-ttl}
+   "PTTL"      {:arity 2 :write? false :denyoom? false :handler cmd-pttl}
+   "PERSIST"   {:arity 2 :write? true  :denyoom? false :handler cmd-persist}})
 
-   "EXPIRE"    {:arity 3 :write? true  :handler cmd-expire}
-   "PEXPIRE"   {:arity 3 :write? true  :handler cmd-pexpire}
-   "EXPIREAT"  {:arity 3 :write? true  :handler cmd-expireat}
-   "PEXPIREAT" {:arity 3 :write? true  :handler cmd-pexpireat}
-   "TTL"       {:arity 2 :write? false :handler cmd-ttl}
-   "PTTL"      {:arity 2 :write? false :handler cmd-pttl}
-   "PERSIST"   {:arity 2 :write? true  :handler cmd-persist}
-
-   "OBJECT" {:arity -2 :write? false :handler cmd-object}
-   "CONFIG" {:arity -2 :write? false :denyoom? false :handler cmd-config}})
-
-(defn- arity-ok?
-  [^long arity ^long n]
+(defn- arity-ok? [^long arity ^long n]
   (if (neg? arity)
     (>= n (- arity))
     (= n arity)))
 
-(defn dispatch
-  [ctx cmd]
+(defn dispatch [ctx cmd]
   (cond
-   (= cmd [:expire-cycle])
+    (= cmd [:expire-cycle])
     (db/expire-cycle! (:db ctx) 1)
 
     (not (seq cmd))
@@ -905,6 +905,10 @@
 
         (not (arity-ok? (:arity spec) (count cmd)))
         (resp/error (str "ERR wrong number of arguments for '" (str/lower-case name) "' command"))
+
+        (and (:denyoom? spec)
+             (not (eviction/ensure-capacity! (:db ctx) (:config ctx))))
+        oom-error
 
         :else
         (try
