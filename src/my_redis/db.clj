@@ -186,17 +186,16 @@
 (defn key-count ^long [db]
   (count (data db)))
 
-(defn all-keys-vec [db]
-  (vec (clojure.core/keys (data db))))
+(defn sample-keys [db ^long n ks]
+  (into [] (take n) (or ks (clojure.core/keys (data db)))))
 
-(defn volatile-keys-vec [db]
-  (vec (:expires @db)))
+(defn oldest-of [db ks]
+  (let [d (data db)]
+    (when (seq ks)
+      (apply min-key #(or (:atime (get d %)) 0) ks))))
 
-(defn oldest-key [db ks]
-  (let [d (data db)
-        target (if ks (select-keys d ks) d)]
-    (when (seq target)
-      (key (apply min-key (fn [[_ e]] (or (:atime e) 0)) target)))))
+(defn volatile-keys-seq [db]
+  (seq (:expires @db)))
 
 (defn evict! [db k]
   (swap! db (fn [s]

@@ -7,18 +7,16 @@
 (defn reset-stats! []
   (reset! stats {:evicted 0}))
 
-(defn- choose-victim [db policy _samples]
+(defn- choose-victim [db policy ^long samples]
   (case policy
     ("allkeys-random")
-    (let [cands (db/all-keys-vec db)]
-      (when (seq cands) (rand-nth cands)))
+    (first (db/sample-keys db 1 nil))
 
     "allkeys-lru"
-    (db/oldest-key db nil)
+    (db/oldest-of db (db/sample-keys db samples nil))
 
     "volatile-lru"
-    (let [cands (db/volatile-keys-vec db)]
-      (when (seq cands) (db/oldest-key db cands)))
+    (db/oldest-of db (db/sample-keys db samples (db/volatile-keys-seq db)))
 
     nil))
 
