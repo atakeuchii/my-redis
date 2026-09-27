@@ -6,7 +6,9 @@
   (let [d (db/create)]
     (db/set-value! d "k" :string "v")
     (is (= "v" (db/get-value d "k")))
-    (is (= {:type :string :value "v"} (db/get-entry d "k")))))
+    (let [e (db/get-entry d "k")]
+      (is (= :string (:type e)))
+      (is (= "v" (:value e))))))
 
 (deftest missing-key-returns-nil
   (let [d (db/create)]

@@ -8,6 +8,12 @@
 
 (defn- ctx [] {:db (db/create) :config (config/create)})
 
+(defn- ctx-with-db
+  "db を直接触りたいテスト用。[ctx db] を返す。"
+  []
+  (let [d (db/create)]
+    [{:db d :config (config/create) :stats (atom {:commands 0})} d]))
+
 (defn- run
   "コマンドを実行して応答を返す。"
   [c & args]
@@ -299,8 +305,7 @@
 
 (deftest mset-is-atomic
   (testing "MSET の途中経過が観測されない"
-    (let [d (db/create)
-          c {:db d}
+    (let [[c d] (ctx-with-db)
           observed (atom #{})
           watching (atom true)]
       (let [watcher (future (while @watching (swap! observed conj (db/size d))))]
@@ -356,8 +361,7 @@
 
 (deftest set-stores-expire-at
   (testing "EX は絶対時刻に変換して保存される（まだ期限切れはしない）"
-    (let [d (db/create)
-          c {:db d}
+    (let [[c d] (ctx-with-db)
           before (db/now)]
       (run c "SET" "k" "v" "EX" "10")
       (let [e (db/get-entry d "k")
@@ -366,8 +370,7 @@
         (is (<= (+ before 10000) exp (+ before 10000 1000)))))))
 
 (deftest set-px-uses-milliseconds
-  (let [d (db/create)
-        c {:db d}
+  (let [[c d] (ctx-with-db)
         before (db/now)]
     (run c "SET" "k" "v" "PX" "5000")
     (is (<= (+ before 5000) (:expire-at (db/get-entry d "k")) (+ before 5000 1000)))))
@@ -392,8 +395,7 @@
     (is (nil? (run c "SET" "k" "v2" "nx")))))
 
 (deftest set-nx-with-ex
-  (let [d (db/create)
-        c {:db d}]
+  (let [[c d] (ctx-with-db)]
     (run c "SET" "k" "v" "NX" "EX" "10")
     (is (some? (:expire-at (db/get-entry d "k"))))))
 
