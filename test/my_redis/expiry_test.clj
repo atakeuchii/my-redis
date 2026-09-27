@@ -1,10 +1,11 @@
 (ns my-redis.expiry-test
   (:require [clojure.test :refer [deftest is testing]]
-            [my-redis.command :as command]
             [my-redis.db :as db]
+            [my-redis.command :as command]
+            [my-redis.config :as config]
             [my-redis.resp :as resp]))
 
-(defn- ctx [] {:db (db/create)})
+(defn- ctx [] {:db (db/create) :config (config/create)})
 (defn- run [c & args] (command/dispatch c (vec args)))
 (defn- err-msg [r] (when (resp/error? r) (:message r)))
 
