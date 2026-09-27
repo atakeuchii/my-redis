@@ -803,6 +803,43 @@
       (resp/error (str "ERR Unknown CONFIG subcommand or wrong number of arguments for '"
                        subcmd "'")))))
 
+;; ---------- INFO ----------
+
+(defn- info-section
+  [title lines]
+  (str "# " title "\r\n"
+       (apply str (map (fn [[k v]] (str k ":" v "\r\n")) lines))
+       "\r\n"))
+
+(defn- cmd-info [ctx [section]]
+  (let [d       (:db ctx)
+        cfg     (:config ctx)
+        sec     (some-> section str/lower-case)
+        dbstats (db/stats d)
+        cmds    (:commands (some-> (:stats ctx) deref) 0)
+        want?   (fn [s] (or (nil? sec) (= sec "all") (= sec s)))]
+    (str
+     (when (want? "server")
+       (info-section "Server"
+                     [["redis_version" "7.0.0-my-redis"]
+                      ["process_id" (.pid (java.lang.ProcessHandle/current))]]))
+     (when (want? "stats")
+       (info-section "Stats"
+                     [["total_commands_processed" cmds]
+                      ["expired_keys" (:expired dbstats 0)]
+                      ["evicted_keys" (:evicted dbstats 0)]]))
+     (when (want? "memory")
+       (info-section "Memory"
+                     [["maxkeys" (config/get-raw cfg "maxkeys")]
+                      ["maxmemory_policy" (config/get-raw cfg "maxmemory-policy")]
+                      ["used_keys" (db/key-count d)]]))
+     (when (want? "keyspace")
+       (let [n (db/size d)]
+         (info-section "Keyspace"
+                       (if (pos? n)
+                         [["db0" (str "keys=" n ",expires=" (db/expires-count d) ",avg_ttl=0")]]
+                         [])))))))
+
 (def command-table
   {"PING"    {:arity -1 :write? false :denyoom? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :denyoom? false :handler cmd-echo}
@@ -812,6 +849,7 @@
    "DBSIZE"  {:arity  1 :write? false :denyoom? false :handler cmd-dbsize}
    "FLUSHDB" {:arity -1 :write? true  :denyoom? false :handler cmd-flushdb}
    "OBJECT"  {:arity -2 :write? false :denyoom? false :handler cmd-object}
+   "INFO"    {:arity -1 :write? false :denyoom? false :handler cmd-info}
 
    "DEL"     {:arity -2 :write? true  :denyoom? false :handler cmd-del}
    "EXISTS"  {:arity -2 :write? false :denyoom? false :handler cmd-exists}
@@ -911,8 +949,10 @@
         oom-error
 
         :else
-        (try
-          ((:handler spec) ctx (vec (rest cmd)))
-          (catch Exception e
-            (println "[command] error in" name ":" (.getMessage e))
-            (resp/error "ERR internal error")))))))
+        (do
+          (when-let [s (:stats ctx)] (swap! s update :commands inc))
+          (try
+            ((:handler spec) ctx (vec (rest cmd)))
+            (catch Exception e
+              (println "[command] error in" name ":" (.getMessage e))
+              (resp/error "ERR internal error"))))))))

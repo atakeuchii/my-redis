@@ -2,18 +2,13 @@
   (:require [my-redis.config :as config]
             [my-redis.db :as db]))
 
-(def stats (atom {:evicted 0}))
-
-(defn reset-stats! []
-  (reset! stats {:evicted 0}))
-
 (defn- choose-victim [db policy ^long samples]
   (case policy
     ("allkeys-random")
-    (first (db/sample-keys db 1 nil))
+    (first (db/sample-keys db 1 :all))
 
     "allkeys-lru"
-    (db/oldest-of db (db/sample-keys db samples nil))
+    (db/oldest-of db (db/sample-keys db samples :all))
 
     "volatile-lru"
     (db/oldest-of db (db/sample-keys db samples (db/volatile-keys-seq db)))
@@ -44,6 +39,5 @@
               :else
               (if-let [victim (choose-victim db policy samples)]
                 (do (db/evict! db victim)
-                    (swap! stats update :evicted inc)
                     (recur (inc guard)))
                 false))))))))

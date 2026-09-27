@@ -8,9 +8,14 @@
   []
   (System/currentTimeMillis))
 
-(defn create
-  []
-  (atom {:data {} :expires #{}}))
+(defn create []
+  (atom {:data {} :expires #{} :stats {:expired 0 :evicted 0}}))
+
+(defn stats [db] (:stats @db))
+
+(defn reset-stats! [db]
+  (swap! db assoc :stats {:expired 0 :evicted 0})
+  nil)
 
 (defn- data [db] (:data @db))
 
@@ -22,11 +27,13 @@
   (let [e (get (data db) k)]
     (cond
       (nil? e) nil
-      (expired? e (now)) (do (swap! db (fn [s]
-                                         (-> s
-                                             (update :data dissoc k)
-                                             (update :expires disj k))))
-                             nil)
+      (expired? e (now))
+      (do (swap! db (fn [s]
+                      (-> s
+                          (update :data dissoc k)
+                          (update :expires disj k)
+                          (update-in [:stats :expired] inc))))
+          nil)
       :else e)))
 
 (defn entry [type value]
@@ -100,7 +107,7 @@
     (count (filter #(contains? (:data old) %) uniq))))
 
 (defn clear! [db]
-  (reset! db {:data {} :expires #{}})
+  (swap! db assoc :data {} :expires #{})
   nil)
 
 (defn wrong-type? [x]
@@ -187,7 +194,7 @@
   (count (data db)))
 
 (defn sample-keys [db ^long n ks]
-  (into [] (take n) (or ks (clojure.core/keys (data db)))))
+  (into [] (take n) (if (= ks :all) (clojure.core/keys (:data @db)) ks)))
 
 (defn oldest-of [db ks]
   (let [d (data db)]
@@ -195,13 +202,14 @@
       (apply min-key #(or (:atime (get d %)) 0) ks))))
 
 (defn volatile-keys-seq [db]
-  (seq (:expires @db)))
+  (or (seq (:expires @db)) []))
 
 (defn evict! [db k]
   (swap! db (fn [s]
               (-> s
                   (update :data dissoc k)
-                  (update :expires disj k))))
+                  (update :expires disj k)
+                  (update-in [:stats :evicted] inc))))
   nil)
 
 ;; ---------- 能動的期限切れ ----------
@@ -244,7 +252,8 @@
                (swap! db (fn [s]
                            (-> s
                                (update :data #(apply dissoc % expired-keys))
-                               (update :expires #(apply disj % expired-keys))))))
+                               (update :expires #(apply disj % expired-keys))
+                               (update-in [:stats :expired] + (count expired-keys))))))
              (let [removed (count expired-keys)
                    ratio (/ (double removed) sampled)]
                (if (and (>= ratio continue-threshold)

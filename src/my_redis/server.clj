@@ -51,7 +51,8 @@
          keyspace (db/create)
          cfg (config/create)
          ctx {:db keyspace
-              :config cfg}
+              :config cfg
+              :stats (atom {:commands 0})}
          ex (executor/start! (fn [cmd] (command/dispatch ctx cmd)))
          cycler (expiry/start! (fn [] (executor/submit! ex [:expire-cycle]))
                                {:interval-ms expire-interval-ms})
