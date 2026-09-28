@@ -9,7 +9,7 @@
   (System/currentTimeMillis))
 
 (defn create []
-  (atom {:data {} :expires #{} :stats {:expired 0 :evicted 0}}))
+  (atom {:data {} :expires #{} :stats {:expired 0 :evicted 0} :pending-dels []}))
 
 (defn stats [db] (:stats @db))
 
@@ -32,7 +32,8 @@
                       (-> s
                           (update :data dissoc k)
                           (update :expires disj k)
-                          (update-in [:stats :expired] inc))))
+                          (update-in [:stats :expired] inc)
+                          (update :pending-dels conj k))))
           nil)
       :else e)))
 
@@ -57,7 +58,6 @@
 (defn size [db]
   (let [t (now)]
     (count (remove #(expired? % t) (vals (data db))))))
-
 
 (defn snapshot [db]
   (let [t (now)]
@@ -107,7 +107,7 @@
     (count (filter #(contains? (:data old) %) uniq))))
 
 (defn clear! [db]
-  (swap! db assoc :data {} :expires #{})
+  (swap! db assoc :data {} :expires #{} :pending-dels [])
   nil)
 
 (defn wrong-type? [x]
@@ -209,7 +209,8 @@
               (-> s
                   (update :data dissoc k)
                   (update :expires disj k)
-                  (update-in [:stats :evicted] inc))))
+                  (update-in [:stats :evicted] inc)
+                  (update :pending-dels conj k))))
   nil)
 
 ;; ---------- 能動的期限切れ ----------
@@ -253,10 +254,15 @@
                            (-> s
                                (update :data #(apply dissoc % expired-keys))
                                (update :expires #(apply disj % expired-keys))
-                               (update-in [:stats :expired] + (count expired-keys))))))
+                               (update-in [:stats :expired] + (count expired-keys))
+                               (update :pending-dels into expired-keys)))))
              (let [removed (count expired-keys)
                    ratio (/ (double removed) sampled)]
                (if (and (>= ratio continue-threshold)
                         (< (System/nanoTime) deadline))
                  (recur (+ total-removed removed))
                  (+ total-removed removed))))))))))
+
+(defn take-pending-dels! [db]
+  (let [[old _] (swap-vals! db assoc :pending-dels [])]
+    (:pending-dels old)))

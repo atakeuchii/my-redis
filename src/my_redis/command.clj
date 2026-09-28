@@ -1,5 +1,6 @@
 (ns my-redis.command
   (:require [clojure.string :as str]
+            [my-redis.aof :as aof]
             [my-redis.resp :as resp]
             [my-redis.db :as db]
             [my-redis.config :as config]
@@ -925,10 +926,47 @@
     (>= n (- arity))
     (= n arity)))
 
+(defn- flush-pending-dels! [ctx]
+  (when (and (:aof ctx) (not (:replaying? ctx)))
+    (doseq [k (db/take-pending-dels! (:db ctx))]
+      (aof/append! (:aof ctx) ["DEL" k]))))
+
+(defn- state-changed? [reply]
+  (and (some? reply)
+       (not (resp/error? reply))
+       (not= reply :no-reply)))
+
+(defn- aof-commands
+  "AOF に記録すべきコマンドのシーケンスを返す。記録不要なら空。"
+  [ctx name args reply]
+  (case name
+    "SPOP"
+    [["SREM" (first args) reply]]
+
+    "EXPIRE"
+    [["PEXPIREAT" (first args) (str (+ (db/now) (* 1000 (parse-long-or-nil (second args)))))]]
+
+    "PEXPIRE"
+    [["PEXPIREAT" (first args) (str (+ (db/now) (parse-long-or-nil (second args))))]]
+
+    "EXPIREAT"
+    [["PEXPIREAT" (first args) (str (* 1000 (parse-long-or-nil (second args))))]]
+
+    "SET"
+    (let [k (first args)
+          exp (db/expired-at (:db ctx) k)]
+      (if exp
+        [(into ["SET"] (take 2 args)) ["PEXPIREAT" k (str exp)]]
+        [(into ["SET"] (take 2 args))]))
+
+    [(into [name] args)]))
+
 (defn dispatch [ctx cmd]
   (cond
     (= cmd [:expire-cycle])
-    (db/expire-cycle! (:db ctx) 1)
+    (let [n (db/expire-cycle! (:db ctx) 1)]
+      (flush-pending-dels! ctx)
+      n)
 
     (not (seq cmd))
     :no-reply
@@ -949,10 +987,15 @@
         oom-error
 
         :else
-        (do
-          (when-let [s (:stats ctx)] (swap! s update :commands inc))
-          (try
-            ((:handler spec) ctx (vec (rest cmd)))
-            (catch Exception e
-              (println "[command] error in" name ":" (.getMessage e))
-              (resp/error "ERR internal error"))))))))
+        (let [args (vec (rest cmd))
+              reply (try
+                      (when-let [s (:stats ctx)] (swap! s update :commands inc))
+                      ((:handler spec) ctx (vec (rest cmd)))
+                      (catch Exception e
+                        (println "[command] error in" name ":" (.getMessage e))
+                        (resp/error "ERR internal error")))]
+          (flush-pending-dels! ctx)
+          (when (and (:aof ctx) (:write? spec) (state-changed? reply) (not (:replaying? ctx)))
+            (doseq [c (aof-commands ctx name args reply)]
+              (aof/append! (:aof ctx) c)))
+          reply)))))

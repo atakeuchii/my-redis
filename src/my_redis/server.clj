@@ -1,5 +1,7 @@
 (ns my-redis.server
-  (:require [my-redis.db :as db]
+  (:require [clojure.java.io :as io]
+            [my-redis.aof :as aof]
+            [my-redis.db :as db]
             [my-redis.command :as command]
             [my-redis.config :as config]
             [my-redis.executor :as executor]
@@ -44,14 +46,17 @@
 
 (defn start!
   ([port] (start! port {}))
-  ([port {:keys [expire-interval-ms verbose?]
-          :or {expire-interval-ms 100 verbose? true}}]
+  ([port {:keys [expire-interval-ms dir appendonly appendfsync verbose?]
+          :or {expire-interval-ms 100 appendonly false appendfsync :everysec verbose? true}}]
    (let [socket (ServerSocket. port)
          actual-port (.getLocalPort socket)
          keyspace (db/create)
          cfg (config/create)
+         aof-handle (when appendonly
+                      (aof/open! (io/file (or dir ".") "appendonly.aof") appendfsync))
          ctx {:db keyspace
               :config cfg
+              :aof aof-handle
               :stats (atom {:commands 0})}
          ex (executor/start! (fn [cmd] (command/dispatch ctx cmd)))
          cycler (expiry/start! (fn [] (executor/submit! ex [:expire-cycle]))
@@ -64,7 +69,8 @@
                       :executor ex
                       :expiry cycler
                       :verbose? verbose?
-                      :config cfg})
+                      :config cfg
+                      :aof aof-handle})
          log (fn [& args] (when verbose? (apply println args)))]
      (future
        (try
@@ -84,7 +90,7 @@
 (defn stop!
   [state]
   (swap! state assoc :running? false)
-  (let [{:keys [^ServerSocket socket connections executor expiry verbose?]} @state
+  (let [{:keys [^ServerSocket socket connections executor expiry aof verbose?]} @state
         log (fn [& args] (when verbose? (apply println args)))]
     (expiry/stop! expiry)
     (doseq [^Socket c connections]
@@ -95,5 +101,6 @@
       (.close socket)
       (catch Exception _ nil))
     (executor/stop! executor)
+    (when aof (aof/close! aof))
     (log "[server] stop requested"))
   nil)
