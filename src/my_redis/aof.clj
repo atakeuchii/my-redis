@@ -51,3 +51,35 @@
 
 (defn file-size ^long [^AOF aof]
   (.length ^File (:file aof)))
+
+(defn replay!
+  "AOF を先頭から読み、各コマンドを handler に渡す。
+   [適用件数 健全なバイト数] を返す。
+   末尾が壊れていれば、そこまでの件数と位置を返す。"
+  [^File file handler]
+  (if-not (.exists file)
+    [0 0]
+    (with-open [in (java.io.BufferedInputStream. (java.io.FileInputStream. file))]
+      (loop [applied 0
+             good-bytes 0]
+        (let [cmd (try
+                    (resp/read-reply in)
+                    (catch java.io.EOFException _ ::eof)
+                    (catch Exception e
+                      (println "[aof] corrupt record:" (.getMessage e))
+                      ::corrupt))]
+          (cond
+            (= cmd ::eof)     [applied good-bytes]
+            (= cmd ::corrupt) [applied good-bytes]
+            (nil? cmd)        (recur applied good-bytes)      ; 空行など
+            :else
+            (do (handler cmd)
+                (recur (inc applied) (- (.length file) (.available in))))))))))
+
+(defn truncate!
+  "壊れた末尾を切り捨てる。"
+  [^File file ^long size]
+  (when (< size (.length file))
+    (println (format "[aof] truncating %d -> %d bytes" (.length file) size))
+    (with-open [raf (java.io.RandomAccessFile. file "rw")]
+      (.setLength raf size))))

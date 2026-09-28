@@ -44,6 +44,22 @@
         (.close sock)
         (catch Exception _ nil)))))
 
+(defn- load-aof!
+  "AOF があればリプレイして状態を復元する。"
+  [^java.io.File file ctx]
+  (when (.exists file)
+    (let [replay-ctx (assoc ctx :replaying? true :aof nil)
+          start (System/nanoTime)
+          [applied good] (aof/replay! file
+                                      (fn [cmd]
+                                        (let [r (command/dispatch replay-ctx cmd)]
+                                          (when (resp/error? r)
+                                            (println "[aof] replay error:" (:message r)
+                                                     "cmd:" (pr-str cmd))))))
+          ms (/ (- (System/nanoTime) start) 1e6)]
+      (println (format "[aof] replayed %d commands in %.1f ms" applied ms))
+      (aof/truncate! file good))))
+
 (defn start!
   ([port] (start! port {}))
   ([port {:keys [expire-interval-ms dir appendonly appendfsync verbose?]
@@ -52,12 +68,11 @@
          actual-port (.getLocalPort socket)
          keyspace (db/create)
          cfg (config/create)
-         aof-handle (when appendonly
-                      (aof/open! (io/file (or dir ".") "appendonly.aof") appendfsync))
-         ctx {:db keyspace
-              :config cfg
-              :aof aof-handle
-              :stats (atom {:commands 0})}
+         aof-file (io/file (or dir ".") "appendonly.aof")
+         base-ctx {:db keyspace :config cfg :stats (atom {:commands 0})}
+         _ (when appendonly (load-aof! aof-file base-ctx))
+         aof-handle (when appendonly (aof/open! aof-file appendfsync))
+         ctx (assoc base-ctx :aof aof-handle)
          ex (executor/start! (fn [cmd] (command/dispatch ctx cmd)))
          cycler (expiry/start! (fn [] (executor/submit! ex [:expire-cycle]))
                                {:interval-ms expire-interval-ms})
@@ -66,11 +81,10 @@
                       :running? true
                       :connections #{}
                       :db keyspace
-                      :executor ex
-                      :expiry cycler
-                      :verbose? verbose?
                       :config cfg
-                      :aof aof-handle})
+                      :aof aof-handle
+                      :executor ex
+                      :expiry cycler})
          log (fn [& args] (when verbose? (apply println args)))]
      (future
        (try
