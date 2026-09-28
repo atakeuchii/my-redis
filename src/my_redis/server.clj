@@ -1,5 +1,7 @@
 (ns my-redis.server
-  (:require [my-redis.db :as db]
+  (:require [clojure.java.io :as io]
+            [my-redis.aof :as aof]
+            [my-redis.db :as db]
             [my-redis.command :as command]
             [my-redis.config :as config]
             [my-redis.executor :as executor]
@@ -42,17 +44,35 @@
         (.close sock)
         (catch Exception _ nil)))))
 
+(defn- load-aof!
+  "AOF があればリプレイして状態を復元する。"
+  [^java.io.File file ctx]
+  (when (.exists file)
+    (let [replay-ctx (assoc ctx :replaying? true :aof nil)
+          start (System/nanoTime)
+          [applied good] (aof/replay! file
+                                      (fn [cmd]
+                                        (let [r (command/dispatch replay-ctx cmd)]
+                                          (when (resp/error? r)
+                                            (println "[aof] replay error:" (:message r)
+                                                     "cmd:" (pr-str cmd))))))
+          ms (/ (- (System/nanoTime) start) 1e6)]
+      (println (format "[aof] replayed %d commands in %.1f ms" applied ms))
+      (aof/truncate! file good))))
+
 (defn start!
   ([port] (start! port {}))
-  ([port {:keys [expire-interval-ms verbose?]
-          :or {expire-interval-ms 100 verbose? true}}]
+  ([port {:keys [expire-interval-ms dir appendonly appendfsync verbose?]
+          :or {expire-interval-ms 100 appendonly false appendfsync :everysec verbose? true}}]
    (let [socket (ServerSocket. port)
          actual-port (.getLocalPort socket)
          keyspace (db/create)
          cfg (config/create)
-         ctx {:db keyspace
-              :config cfg
-              :stats (atom {:commands 0})}
+         aof-file (io/file (or dir ".") "appendonly.aof")
+         base-ctx {:db keyspace :config cfg :stats (atom {:commands 0})}
+         _ (when appendonly (load-aof! aof-file base-ctx))
+         aof-handle (when appendonly (aof/open! aof-file appendfsync))
+         ctx (assoc base-ctx :aof aof-handle)
          ex (executor/start! (fn [cmd] (command/dispatch ctx cmd)))
          cycler (expiry/start! (fn [] (executor/submit! ex [:expire-cycle]))
                                {:interval-ms expire-interval-ms})
@@ -61,10 +81,10 @@
                       :running? true
                       :connections #{}
                       :db keyspace
+                      :config cfg
+                      :aof aof-handle
                       :executor ex
-                      :expiry cycler
-                      :verbose? verbose?
-                      :config cfg})
+                      :expiry cycler})
          log (fn [& args] (when verbose? (apply println args)))]
      (future
        (try
@@ -84,7 +104,7 @@
 (defn stop!
   [state]
   (swap! state assoc :running? false)
-  (let [{:keys [^ServerSocket socket connections executor expiry verbose?]} @state
+  (let [{:keys [^ServerSocket socket connections executor expiry aof verbose?]} @state
         log (fn [& args] (when verbose? (apply println args)))]
     (expiry/stop! expiry)
     (doseq [^Socket c connections]
@@ -95,5 +115,6 @@
       (.close socket)
       (catch Exception _ nil))
     (executor/stop! executor)
+    (when aof (aof/close! aof))
     (log "[server] stop requested"))
   nil)
