@@ -1,6 +1,6 @@
 (ns my-redis.aof
   (:require [my-redis.resp :as resp])
-  (:import [java.io File FileOutputStream BufferedOutputStream]
+  (:import [java.io File FileOutputStream BufferedOutputStream OutputStream RandomAccessFile]
            [java.nio.channels FileChannel]))
 
 (defrecord AOF [^FileOutputStream out ^BufferedOutputStream buf file fsync-mode fsync-thread running?])
@@ -81,5 +81,25 @@
   [^File file ^long size]
   (when (< size (.length file))
     (println (format "[aof] truncating %d -> %d bytes" (.length file) size))
-    (with-open [raf (java.io.RandomAccessFile. file "rw")]
+    (with-open [raf (RandomAccessFile. file "rw")]
       (.setLength raf size))))
+
+(defn current-size
+  "現在のファイルサイズ。flush してから測る。"
+  ^long [^AOF aof]
+  (locking (:out aof)
+    (.flush ^BufferedOutputStream (:buf aof))
+    (.length ^File (:file aof))))
+
+(defn copy-from!
+  "src の offset 以降を dest に追記する。コピーしたバイト数を返す。"
+  ^long [^File src ^long offset ^OutputStream dest]
+  (with-open [in (RandomAccessFile. src "r")]
+    (.seek in offset)
+    (let [buf (byte-array 65536)]
+      (loop [total 0]
+        (let [n (.read in buf)]
+          (if (neg? n)
+            total
+            (do (.write dest buf 0 n)
+                (recur (+ total n)))))))))
