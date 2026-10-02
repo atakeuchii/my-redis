@@ -6,9 +6,10 @@
             [my-redis.config :as config]
             [my-redis.executor :as executor]
             [my-redis.expiry :as expiry]
+            [my-redis.rewrite :as rewrite]
             [my-redis.resp :as resp])
   (:import [java.net ServerSocket Socket SocketException]
-           [java.io BufferedInputStream BufferedOutputStream EOFException]))
+           [java.io BufferedInputStream BufferedOutputStream EOFException File]))
 
 (defn- serve-connection!
   [server-state ^Socket sock]
@@ -45,10 +46,9 @@
         (catch Exception _ nil)))))
 
 (defn- load-aof!
-  "AOF があればリプレイして状態を復元する。"
-  [^java.io.File file ctx]
+  [^File file ctx log]
   (when (.exists file)
-    (let [replay-ctx (assoc ctx :replaying? true :aof nil)
+    (let [replay-ctx (assoc ctx :replaying? true :aof-ref nil)
           start (System/nanoTime)
           [applied good] (aof/replay! file
                                       (fn [cmd]
@@ -57,23 +57,46 @@
                                             (println "[aof] replay error:" (:message r)
                                                      "cmd:" (pr-str cmd))))))
           ms (/ (- (System/nanoTime) start) 1e6)]
-      (println (format "[aof] replayed %d commands in %.1f ms" applied ms))
+      (log (format "[aof] replayed %d commands in %.1f ms" applied ms))
       (aof/truncate! file good))))
 
 (defn start!
   ([port] (start! port {}))
   ([port {:keys [expire-interval-ms dir appendonly appendfsync verbose?]
           :or {expire-interval-ms 100 appendonly false appendfsync :everysec verbose? true}}]
-   (let [socket (ServerSocket. port)
+   (let [log (fn [& args] (when verbose? (apply println args)))
+         socket (ServerSocket. port)
          actual-port (.getLocalPort socket)
          keyspace (db/create)
          cfg (config/create)
-         aof-file (io/file (or dir ".") "appendonly.aof")
+         ^File aof-file (io/file (or dir ".") "appendonly.aof")
+         aof-base-size (atom (if appendonly (.length aof-file) 0))
          base-ctx {:db keyspace :config cfg :stats (atom {:commands 0})}
-         _ (when appendonly (load-aof! aof-file base-ctx))
-         aof-handle (when appendonly (aof/open! aof-file appendfsync))
-         ctx (assoc base-ctx :aof aof-handle)
+         _ (when appendonly (load-aof! aof-file base-ctx log))
+         aof-ref (atom (when appendonly (aof/open! aof-file appendfsync)))
+         rewriting? (atom false)
+         ;; executor を先に宣言できないので、実行関数を後から差し込む
+         ex-ref (atom nil)
+         start-rw (fn [prepared]
+                    (future
+                      (try
+                        (let [built (rewrite/build! prepared aof-file)
+                              r     (executor/submit! @ex-ref [:commit-rewrite built])]
+                          (log (format "[aof] rewrite done: %d commands, %d -> %d bytes (copied %d)"
+                                       (:commands built) (:old-size r)
+                                       (:new-size r) (:copied-bytes built))))
+                        (catch Exception e
+                          (println "[aof] rewrite failed:" (.getMessage e)))
+                        (finally (reset! rewriting? false)))))
+         ctx (assoc base-ctx
+                    :aof-ref aof-ref
+                    :aof-file aof-file
+                    :appendfsync appendfsync
+                    :aof-base-size aof-base-size
+                    :rewrite-running? rewriting?
+                    :start-rewrite start-rw)
          ex (executor/start! (fn [cmd] (command/dispatch ctx cmd)))
+         _ (reset! ex-ref ex)
          cycler (expiry/start! (fn [] (executor/submit! ex [:expire-cycle]))
                                {:interval-ms expire-interval-ms})
          state (atom {:socket socket
@@ -82,10 +105,11 @@
                       :connections #{}
                       :db keyspace
                       :config cfg
-                      :aof aof-handle
+                      :ctx ctx
+                      :aof-ref aof-ref
+                      :aof-base-size aof-base-size
                       :executor ex
-                      :expiry cycler})
-         log (fn [& args] (when verbose? (apply println args)))]
+                      :expiry cycler})]
      (future
        (try
          (log (format "[server] listening on %d" actual-port))
@@ -95,17 +119,15 @@
              (recur)))
          (catch SocketException e
            (if (:running? @state)
-             (log "[server] accept error:" (.getMessage e))
+             (println "[server] accept error:" (.getMessage e))
              (log "[server] stopped")))
          (catch Exception e
-           (log "[server] fatal:" (.getMessage e)))))
+           (println "[server] fatal:" (.getMessage e)))))
      state)))
 
-(defn stop!
-  [state]
+(defn stop! [state]
   (swap! state assoc :running? false)
-  (let [{:keys [^ServerSocket socket connections executor expiry aof verbose?]} @state
-        log (fn [& args] (when verbose? (apply println args)))]
+  (let [{:keys [^ServerSocket socket connections executor expiry aof-ref]} @state]
     (expiry/stop! expiry)
     (doseq [^Socket c connections]
       (try
@@ -115,6 +137,6 @@
       (.close socket)
       (catch Exception _ nil))
     (executor/stop! executor)
-    (when aof (aof/close! aof))
-    (log "[server] stop requested"))
+    (when-let [a @aof-ref] (aof/close! a)))
+  (println "[server] stop requested")
   nil)

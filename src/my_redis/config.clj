@@ -3,7 +3,9 @@
 (def defaults
   {"maxkeys"          "0"
    "maxmemory-policy" "noeviction"
-   "maxmemory-samples" "5"})
+   "maxmemory-samples" "5"
+   "auto-aof-rewrite-percentage" "100"
+   "auto-aof-rewrite-min-size"   "67108864"})
 
 (def valid-policies
   #{"noeviction" "allkeys-random" "allkeys-lru" "volatile-lru"})

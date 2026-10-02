@@ -25,11 +25,10 @@
           (if cmd (recur (conj acc cmd)) acc))))))
 
 (defn- ctx-with-aof
-  "AOF 付きの ctx と、AOF ハンドル・ファイルを返す。"
   ([] (ctx-with-aof (temp-file)))
   ([^File f]
    (let [a (aof/open! f :always)]
-     [{:db (db/create) :config (config/create) :aof a
+     [{:db (db/create) :config (config/create) :aof-ref (atom a)
        :stats (atom {:commands 0})}
       a f])))
 
@@ -154,7 +153,7 @@
   "AOF をリプレイして新しい ctx を作る。"
   [^File f]
   (let [c {:db (db/create) :config (config/create)
-           :replaying? true :aof nil :stats (atom {:commands 0})}
+           :replaying? true :aof-ref nil :stats (atom {:commands 0})}
         [applied good] (aof/replay! f (fn [cmd] (command/dispatch c cmd)))]
     [c applied good]))
 
@@ -241,7 +240,7 @@
 
     ;; 切り捨て後に追記できる
     (let [a2 (aof/open! f :always)
-          c2 {:db (db/create) :config (config/create) :aof a2
+          c2 {:db (db/create) :config (config/create) :aof-ref (atom a2)
               :stats (atom {:commands 0})}]
       (run c2 "SET" "b" "2")
       (aof/close! a2)

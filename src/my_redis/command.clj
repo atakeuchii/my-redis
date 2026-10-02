@@ -4,8 +4,9 @@
             [my-redis.resp :as resp]
             [my-redis.db :as db]
             [my-redis.config :as config]
-            [my-redis.types.list :as dlist]
             [my-redis.eviction :as eviction]
+            [my-redis.rewrite :as rewrite]
+            [my-redis.types.list :as dlist]
             [my-redis.types.zset :as zset])
   (:import [java.util.regex Pattern]))
 
@@ -790,7 +791,9 @@
             (and (= k "maxmemory-policy") (not (config/valid-policies v)))
             (resp/error "ERR CONFIG SET failed - argument couldn't be parsed into an integer")
 
-            (and (#{"maxkeys" "maxmemory-samples"} k) (nil? (parse-long-or-nil v)))
+            (and (#{"maxkeys" "maxmemory-samples"
+                    "auto-aof-rewrite-percentage" "auto-aof-rewrite-min-size"} k)
+                 (nil? (parse-long-or-nil v)))
             (resp/error "ERR CONFIG SET failed - argument couldn't be parsed into an integer")
 
             :else
@@ -803,6 +806,38 @@
 
       (resp/error (str "ERR Unknown CONFIG subcommand or wrong number of arguments for '"
                        subcmd "'")))))
+
+(defn- current-aof
+  "現在の AOF ハンドル。rewrite で差し替わるので atom 経由で読む。"
+  [ctx]
+  (when-let [r (:aof-ref ctx)] @r))
+
+(defn- flush-pending-dels!
+  "サーバ自身が削除したキーを DEL として AOF に記録する。"
+  [ctx]
+  (when-let [a (and (not (:replaying? ctx)) (current-aof ctx))]
+    (doseq [k (db/take-pending-dels! (:db ctx))]
+      (aof/append! a ["DEL" k]))))
+
+(defn- rewrite-running? [ctx]
+  (boolean (some-> (:rewrite-running? ctx) deref)))
+
+(defn- cmd-bgrewriteaof [ctx _args]
+  (cond
+    (nil? (current-aof ctx))
+    (resp/error "ERR AOF is not enabled")
+
+    (nil? (:start-rewrite ctx))
+    (resp/error "ERR rewrite is not supported in this context")
+
+    (rewrite-running? ctx)
+    (resp/simple "Background append only file rewriting already in progress")
+
+    :else
+    (let [prepared (rewrite/prepare (:db ctx) (current-aof ctx))]
+      (reset! (:rewrite-running? ctx) true)
+      ((:start-rewrite ctx) prepared)
+      (resp/simple "Background append only file rewriting started"))))
 
 ;; ---------- INFO ----------
 
@@ -839,7 +874,14 @@
          (info-section "Keyspace"
                        (if (pos? n)
                          [["db0" (str "keys=" n ",expires=" (db/expires-count d) ",avg_ttl=0")]]
-                         [])))))))
+                         []))))
+     (when (want? "persistence")
+       (info-section "Persistence"
+                     [["aof_enabled" (if (current-aof ctx) 1 0)]
+                      ["aof_rewrite_in_progress"
+                       (if (and (:rewrite-running? ctx) @(:rewrite-running? ctx)) 1 0)]
+                      ["aof_current_size" (if-let [a (current-aof ctx)] (aof/current-size a) 0)]
+                      ["aof_base_size" (or (some-> (:aof-base-size ctx) deref) 0)]])))))
 
 (def command-table
   {"PING"    {:arity -1 :write? false :denyoom? false :handler cmd-ping}
@@ -851,6 +893,7 @@
    "FLUSHDB" {:arity -1 :write? true  :denyoom? false :handler cmd-flushdb}
    "OBJECT"  {:arity -2 :write? false :denyoom? false :handler cmd-object}
    "INFO"    {:arity -1 :write? false :denyoom? false :handler cmd-info}
+   "BGREWRITEAOF" {:arity 1 :write? false :denyoom? false :handler cmd-bgrewriteaof}
 
    "DEL"     {:arity -2 :write? true  :denyoom? false :handler cmd-del}
    "EXISTS"  {:arity -2 :write? false :denyoom? false :handler cmd-exists}
@@ -926,11 +969,6 @@
     (>= n (- arity))
     (= n arity)))
 
-(defn- flush-pending-dels! [ctx]
-  (when (and (:aof ctx) (not (:replaying? ctx)))
-    (doseq [k (db/take-pending-dels! (:db ctx))]
-      (aof/append! (:aof ctx) ["DEL" k]))))
-
 (defn- state-changed? [reply]
   (and (some? reply)
        (not (resp/error? reply))
@@ -961,12 +999,50 @@
 
     [(into [name] args)]))
 
+(defn- should-rewrite?
+  "自動 rewrite の条件を満たすか。
+   前回 rewrite 直後のサイズから percentage 以上増え、かつ min-size 以上。"
+  [ctx]
+  (when-let [a (current-aof ctx)]
+    (let [cfg  (:config ctx)
+          pct  (config/get-long cfg "auto-aof-rewrite-percentage" 100)
+          minsz (config/get-long cfg "auto-aof-rewrite-min-size" 67108864)
+          base (or @(:aof-base-size ctx) 0)
+          cur  (aof/current-size a)]
+      (and (pos? pct)
+           (>= cur minsz)
+           (or (zero? base)
+               (>= cur (+ base (quot (* base pct) 100))))))))
+
+(defn- maybe-auto-rewrite!
+  "条件を満たせば rewrite を開始する。"
+  [ctx]
+  (when (and (:start-rewrite ctx)
+             (rewrite-running? ctx)
+             (should-rewrite? ctx))
+    (let [prepared (rewrite/prepare (:db ctx) (current-aof ctx))]
+      (reset! (:rewrite-running? ctx) true)
+      ((:start-rewrite ctx) prepared)
+      (println "[aof] auto rewrite triggered"))))
+
 (defn dispatch [ctx cmd]
   (cond
     (= cmd [:expire-cycle])
     (let [n (db/expire-cycle! (:db ctx) 1)]
       (flush-pending-dels! ctx)
+      (maybe-auto-rewrite! ctx)
       n)
+
+    (and (vector? cmd) (= :commit-rewrite (first cmd)))
+    (let [built  (second cmd)
+          result (rewrite/commit! built (:aof-file ctx))
+          old    (current-aof ctx)
+          new    (aof/open! (:aof-file ctx) (:appendfsync ctx))]
+      (reset! (:aof-ref ctx) new)
+      (when old (aof/close! old))
+      (when-let [b (:aof-base-size ctx)]
+        (reset! b (:new-size result)))
+      result)
 
     (not (seq cmd))
     :no-reply
@@ -983,6 +1059,7 @@
         (resp/error (str "ERR wrong number of arguments for '" (str/lower-case name) "' command"))
 
         (and (:denyoom? spec)
+             (not (:replaying? ctx))
              (not (eviction/ensure-capacity! (:db ctx) (:config ctx))))
         oom-error
 
@@ -990,12 +1067,15 @@
         (let [args (vec (rest cmd))
               reply (try
                       (when-let [s (:stats ctx)] (swap! s update :commands inc))
-                      ((:handler spec) ctx (vec (rest cmd)))
+                      ((:handler spec) ctx args)
                       (catch Exception e
                         (println "[command] error in" name ":" (.getMessage e))
                         (resp/error "ERR internal error")))]
           (flush-pending-dels! ctx)
-          (when (and (:aof ctx) (:write? spec) (state-changed? reply) (not (:replaying? ctx)))
+          (when-let [a (and (:write? spec)
+                            (state-changed? reply)
+                            (not (:replaying? ctx))
+                            (current-aof ctx))]
             (doseq [c (aof-commands ctx name args reply)]
-              (aof/append! (:aof ctx) c)))
+              (aof/append! a c)))
           reply)))))
