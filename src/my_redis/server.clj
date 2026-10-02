@@ -6,6 +6,7 @@
             [my-redis.config :as config]
             [my-redis.executor :as executor]
             [my-redis.expiry :as expiry]
+            [my-redis.rdb :as rdb]
             [my-redis.rewrite :as rewrite]
             [my-redis.resp :as resp])
   (:import [java.net ServerSocket Socket SocketException]
@@ -60,6 +61,16 @@
       (log (format "[aof] replayed %d commands in %.1f ms" applied ms))
       (aof/truncate! file good))))
 
+(defn- load-rdb!
+  [^File file ctx log]
+  (when (.exists file)
+    (let [start (System/nanoTime)
+          cmds  (rdb/load-commands file)
+          rctx  (assoc ctx :replaying? true :aof-ref nil)]
+      (doseq [cmd cmds] (command/dispatch rctx cmd))
+      (log (format "[rdb] loaded %d commands in %.1f ms"
+                   (count cmds) (/ (- (System/nanoTime) start) 1e6))))))
+
 (defn start!
   ([port] (start! port {}))
   ([port {:keys [expire-interval-ms dir appendonly appendfsync verbose?]
@@ -72,10 +83,8 @@
          ^File aof-file (io/file (or dir ".") "appendonly.aof")
          aof-base-size (atom (if appendonly (.length aof-file) 0))
          base-ctx {:db keyspace :config cfg :stats (atom {:commands 0})}
-         _ (when appendonly (load-aof! aof-file base-ctx log))
          aof-ref (atom (when appendonly (aof/open! aof-file appendfsync)))
          rewriting? (atom false)
-         ;; executor を先に宣言できないので、実行関数を後から差し込む
          ex-ref (atom nil)
          start-rw (fn [prepared]
                     (future
@@ -88,13 +97,37 @@
                         (catch Exception e
                           (println "[aof] rewrite failed:" (.getMessage e)))
                         (finally (reset! rewriting? false)))))
+         rdb-file (io/file (or dir ".") "dump.rdb")
+         rdb-stats (atom {:last-save 0 :changes 0})
+         bgsaving? (atom false)
+         _ (if appendonly
+             (load-aof! aof-file base-ctx log)
+             (load-rdb! rdb-file base-ctx log))
+         _ (when appendonly
+             (reset! aof-base-size (.length aof-file))
+             (reset! aof-ref (aof/open! aof-file appendfsync)))
+         start-save (fn [prepared]
+                      (future
+                        (try
+                          (let [r (rdb/write-file! rdb-file (:snapshot prepared) (:now prepared))]
+                            (swap! rdb-stats assoc
+                                   :last-save (quot (System/currentTimeMillis) 1000) :changes 0)
+                            (log (format "[rdb] bgsave done: %d entries, %d bytes"
+                                         (:entries r) (:bytes r))))
+                          (catch Exception e
+                            (println "[rdb] bgsave failed:" (.getMessage e)))
+                          (finally (reset! bgsaving? false)))))
          ctx (assoc base-ctx
                     :aof-ref aof-ref
                     :aof-file aof-file
                     :appendfsync appendfsync
                     :aof-base-size aof-base-size
                     :rewrite-running? rewriting?
-                    :start-rewrite start-rw)
+                    :start-rewrite start-rw
+                    :rdb-file rdb-file
+                    :rdb-stats rdb-stats
+                    :bgsave-running? bgsaving?
+                    :start-bgsave start-save)
          ex (executor/start! (fn [cmd] (command/dispatch ctx cmd)))
          _ (reset! ex-ref ex)
          cycler (expiry/start! (fn [] (executor/submit! ex [:expire-cycle]))
@@ -109,7 +142,8 @@
                       :aof-ref aof-ref
                       :aof-base-size aof-base-size
                       :executor ex
-                      :expiry cycler})]
+                      :expiry cycler
+                      :rdb-file rdb-file})]
      (future
        (try
          (log (format "[server] listening on %d" actual-port))
@@ -127,7 +161,8 @@
 
 (defn stop! [state]
   (swap! state assoc :running? false)
-  (let [{:keys [^ServerSocket socket connections executor expiry aof-ref]} @state]
+  (let [{:keys [^ServerSocket socket connections executor expiry aof-ref verbose?]} @state
+        log (fn [& args] (when verbose? (apply println args)))]
     (expiry/stop! expiry)
     (doseq [^Socket c connections]
       (try
@@ -137,6 +172,6 @@
       (.close socket)
       (catch Exception _ nil))
     (executor/stop! executor)
-    (when-let [a @aof-ref] (aof/close! a)))
-  (println "[server] stop requested")
+    (when-let [a @aof-ref] (aof/close! a))
+    (log "[server] stop requested"))
   nil)
