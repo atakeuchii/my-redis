@@ -791,7 +791,9 @@
             (and (= k "maxmemory-policy") (not (config/valid-policies v)))
             (resp/error "ERR CONFIG SET failed - argument couldn't be parsed into an integer")
 
-            (and (#{"maxkeys" "maxmemory-samples"} k) (nil? (parse-long-or-nil v)))
+            (and (#{"maxkeys" "maxmemory-samples"
+                    "auto-aof-rewrite-percentage" "auto-aof-rewrite-min-size"} k)
+                 (nil? (parse-long-or-nil v)))
             (resp/error "ERR CONFIG SET failed - argument couldn't be parsed into an integer")
 
             :else
@@ -817,6 +819,9 @@
     (doseq [k (db/take-pending-dels! (:db ctx))]
       (aof/append! a ["DEL" k]))))
 
+(defn- rewrite-running? [ctx]
+  (boolean (some-> (:rewrite-running? ctx) deref)))
+
 (defn- cmd-bgrewriteaof [ctx _args]
   (cond
     (nil? (current-aof ctx))
@@ -825,7 +830,7 @@
     (nil? (:start-rewrite ctx))
     (resp/error "ERR rewrite is not supported in this context")
 
-    @(:rewrite-running? ctx)
+    (rewrite-running? ctx)
     (resp/simple "Background append only file rewriting already in progress")
 
     :else
@@ -869,7 +874,14 @@
          (info-section "Keyspace"
                        (if (pos? n)
                          [["db0" (str "keys=" n ",expires=" (db/expires-count d) ",avg_ttl=0")]]
-                         [])))))))
+                         []))))
+     (when (want? "persistence")
+       (info-section "Persistence"
+                     [["aof_enabled" (if (current-aof ctx) 1 0)]
+                      ["aof_rewrite_in_progress"
+                       (if (and (:rewrite-running? ctx) @(:rewrite-running? ctx)) 1 0)]
+                      ["aof_current_size" (if-let [a (current-aof ctx)] (aof/current-size a) 0)]
+                      ["aof_base_size" (or (some-> (:aof-base-size ctx) deref) 0)]])))))
 
 (def command-table
   {"PING"    {:arity -1 :write? false :denyoom? false :handler cmd-ping}
@@ -987,11 +999,38 @@
 
     [(into [name] args)]))
 
+(defn- should-rewrite?
+  "自動 rewrite の条件を満たすか。
+   前回 rewrite 直後のサイズから percentage 以上増え、かつ min-size 以上。"
+  [ctx]
+  (when-let [a (current-aof ctx)]
+    (let [cfg  (:config ctx)
+          pct  (config/get-long cfg "auto-aof-rewrite-percentage" 100)
+          minsz (config/get-long cfg "auto-aof-rewrite-min-size" 67108864)
+          base (or @(:aof-base-size ctx) 0)
+          cur  (aof/current-size a)]
+      (and (pos? pct)
+           (>= cur minsz)
+           (or (zero? base)
+               (>= cur (+ base (quot (* base pct) 100))))))))
+
+(defn- maybe-auto-rewrite!
+  "条件を満たせば rewrite を開始する。"
+  [ctx]
+  (when (and (:start-rewrite ctx)
+             (rewrite-running? ctx)
+             (should-rewrite? ctx))
+    (let [prepared (rewrite/prepare (:db ctx) (current-aof ctx))]
+      (reset! (:rewrite-running? ctx) true)
+      ((:start-rewrite ctx) prepared)
+      (println "[aof] auto rewrite triggered"))))
+
 (defn dispatch [ctx cmd]
   (cond
     (= cmd [:expire-cycle])
     (let [n (db/expire-cycle! (:db ctx) 1)]
       (flush-pending-dels! ctx)
+      (maybe-auto-rewrite! ctx)
       n)
 
     (and (vector? cmd) (= :commit-rewrite (first cmd)))
@@ -1001,6 +1040,8 @@
           new    (aof/open! (:aof-file ctx) (:appendfsync ctx))]
       (reset! (:aof-ref ctx) new)
       (when old (aof/close! old))
+      (when-let [b (:aof-base-size ctx)]
+        (reset! b (:new-size result)))
       result)
 
     (not (seq cmd))

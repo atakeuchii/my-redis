@@ -47,39 +47,53 @@
       (concat cmds [["PEXPIREAT" k (str expire-at)]])
       cmds)))
 
-(defn snapshot-commands [snapshot]
-  (mapcat (fn [[k entry]] (entry-commands k entry)) snapshot))
+(defn snapshot-commands
+  "スナップショット（{k entry}）全体を再現するコマンド列。
+   期限切れは now を基準にここで除外する（prepare を O(1) に保つため）。
+   遅延シーケンスなので、書き出しながら生成される。"
+  [snapshot now]
+  (mapcat (fn [[k entry]]
+            (when-not (db/expired? entry now)
+              (entry-commands k entry)))
+          snapshot))
 
 (defn- write-commands!
   ^long [^OutputStream out cmds]
   (reduce (fn [n cmd] (resp/write-reply! out cmd) (inc n)) 0 cmds))
 
+
 (defn prepare
   "rewrite の起点を取る。実行スレッドから呼ぶこと。
    オフセットとスナップショットの取得の間に書き込みが入ると、
-   その書き込みがどちらにも含まれず失われるため、不可分に行う必要がある。"
+   その書き込みがどちらにも含まれず失われるため、不可分に行う必要がある。
+   期限切れの除外はしない（O(N) になるため build! に任せる）。"
   [db aof-handle]
   {:offset   (if aof-handle (aof/current-size aof-handle) 0)
-   :snapshot (db/snapshot db)})
+   :snapshot (:data @db)
+   :now      (db/now)})
 
 (defn build!
   "スナップショットから一時ファイルを作る。rename はしない。
-   時間がかかるので別スレッドで実行してよい。"
-  [{:keys [offset snapshot]} ^File aof-file]
+   時間がかかるので別スレッドで実行してよい。
+   :copied-to は旧 AOF をどこまで読んだか。commit! で続きを拾うために返す。"
+  [{:keys [offset snapshot now]} ^File aof-file]
   (let [tmp (File. (str (.getAbsolutePath aof-file) ".rewrite-tmp"))]
     (.delete tmp)
     (with-open [out (BufferedOutputStream. (FileOutputStream. tmp))]
-      (let [n      (write-commands! out (snapshot-commands snapshot))
+      (let [n      (write-commands! out (snapshot-commands snapshot now))
             copied (if (.exists aof-file) (aof/copy-from! aof-file offset out) 0)]
         (.flush out)
-        {:tmp tmp :commands n :copied-bytes copied}))))
+        {:tmp tmp :commands n :copied-bytes copied :copied-to (+ offset copied)}))))
 
 (defn commit!
   "一時ファイルを本番にアトミックに差し替える。実行スレッドから呼ぶこと。
-   rename と AOF ハンドルの差し替えの間に書き込みが入ると、
-   削除された inode に書かれて失われるため、実行スレッドで一気にやる必要がある。"
-  [{:keys [^File tmp]} ^File aof-file]
+   build! が読み終えた位置以降に追記されたぶんを、ここで最終的に拾う。
+   実行スレッドで走るので、この最中に新たな書き込みは入らない。"
+  [{:keys [^File tmp copied-to]} ^File aof-file]
   (let [old-size (.length aof-file)]
+    (when (and (.exists aof-file) (< (long copied-to) old-size))
+      (with-open [out (BufferedOutputStream. (FileOutputStream. tmp true))]
+        (aof/copy-from! aof-file copied-to out)))
     (Files/move (.toPath tmp) (.toPath aof-file)
                 (into-array CopyOption
                             [StandardCopyOption/REPLACE_EXISTING

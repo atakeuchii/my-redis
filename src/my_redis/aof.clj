@@ -21,7 +21,9 @@
                           (try
                             (while @running?
                               (Thread/sleep 1000)
-                              (locking out (fsync! aof)))
+                              (locking out
+                                (when @running?
+                                  (fsync! aof))))
                             (catch InterruptedException _ nil)
                             (catch Exception e
                               (println "[aof] fsync error:" (.getMessage e)))))

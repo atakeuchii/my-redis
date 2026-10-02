@@ -70,6 +70,7 @@
          keyspace (db/create)
          cfg (config/create)
          ^File aof-file (io/file (or dir ".") "appendonly.aof")
+         aof-base-size (atom (if appendonly (.length aof-file) 0))
          base-ctx {:db keyspace :config cfg :stats (atom {:commands 0})}
          _ (when appendonly (load-aof! aof-file base-ctx log))
          aof-ref (atom (when appendonly (aof/open! aof-file appendfsync)))
@@ -91,6 +92,7 @@
                     :aof-ref aof-ref
                     :aof-file aof-file
                     :appendfsync appendfsync
+                    :aof-base-size aof-base-size
                     :rewrite-running? rewriting?
                     :start-rewrite start-rw)
          ex (executor/start! (fn [cmd] (command/dispatch ctx cmd)))
@@ -103,7 +105,9 @@
                       :connections #{}
                       :db keyspace
                       :config cfg
+                      :ctx ctx
                       :aof-ref aof-ref
+                      :aof-base-size aof-base-size
                       :executor ex
                       :expiry cycler})]
      (future
