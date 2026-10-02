@@ -196,7 +196,7 @@
 
 (deftest replay-does-not-rewrite-aof
   (testing "リプレイ中は AOF に追記しない"
-    (let [[c a f] (ctx-with-aof)]
+    (let [[c a ^File f] (ctx-with-aof)]
       (run c "SET" "k" "v")
       (aof/close! a)
       (let [before (.length f)]
@@ -211,7 +211,7 @@
 ;; ---------- 末尾破損 ----------
 
 (deftest replay-survives-truncated-tail
-  (let [[c a f] (ctx-with-aof)]
+  (let [[c a ^File f] (ctx-with-aof)]
     (run c "SET" "a" "1")
     (run c "SET" "b" "2")
     (aof/close! a)
@@ -229,7 +229,7 @@
         (is (= [["SET" "a" "1"] ["SET" "b" "2"]] (read-all f)))))))
 
 (deftest append-after-truncate-works
-  (let [[c a f] (ctx-with-aof)]
+  (let [[c a ^File f] (ctx-with-aof)]
     (run c "SET" "a" "1")
     (aof/close! a)
     (with-open [o (FileOutputStream. f true)]
@@ -281,4 +281,4 @@
           (is (= 3 (executor/submit! ex2 ["DBSIZE"])))
           (finally (server/stop! srv2))))
       (finally
-        (doseq [f (reverse (file-seq dir))] (.delete f))))))
+        (doseq [^File f (reverse (file-seq dir))] (.delete f))))))

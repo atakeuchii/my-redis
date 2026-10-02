@@ -1055,7 +1055,7 @@
   "条件を満たせば rewrite を開始する。"
   [ctx]
   (when (and (:start-rewrite ctx)
-             (rewrite-running? ctx)
+             (not (rewrite-running? ctx))
              (should-rewrite? ctx))
     (let [prepared (rewrite/prepare (:db ctx) (current-aof ctx))]
       (reset! (:rewrite-running? ctx) true)
