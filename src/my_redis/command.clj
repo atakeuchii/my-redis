@@ -5,6 +5,7 @@
             [my-redis.db :as db]
             [my-redis.config :as config]
             [my-redis.eviction :as eviction]
+            [my-redis.rdb :as rdb]
             [my-redis.rewrite :as rewrite]
             [my-redis.types.list :as dlist]
             [my-redis.types.zset :as zset])
@@ -881,7 +882,39 @@
                       ["aof_rewrite_in_progress"
                        (if (and (:rewrite-running? ctx) @(:rewrite-running? ctx)) 1 0)]
                       ["aof_current_size" (if-let [a (current-aof ctx)] (aof/current-size a) 0)]
-                      ["aof_base_size" (or (some-> (:aof-base-size ctx) deref) 0)]])))))
+                      ["aof_base_size" (or (some-> (:aof-base-size ctx) deref) 0)]
+                      ["rdb_bgsave_in_progress" (if (some-> (:bgsave-running? ctx) deref) 1 0)]
+                      ["rdb_last_save_time" (or (some-> (:rdb-stats ctx) deref :last-save) 0)]])))))
+
+;; ---------- RDB ----------
+
+(defn- rdb-snapshot
+  "RDB 書き出し用の起点。実行スレッドで取る（O(1)）。"
+  [ctx]
+  {:snapshot (:data @(:db ctx)) :now (db/now)})
+
+(defn- cmd-save [ctx _args]
+  (if-not (:rdb-file ctx)
+    (resp/error "ERR RDB is not configured")
+    (let [{:keys [snapshot now]} (rdb-snapshot ctx)]
+      (rdb/write-file! (:rdb-file ctx) snapshot now)
+      (when-let [s (:rdb-stats ctx)]
+        (swap! s assoc :last-save (quot (System/currentTimeMillis) 1000) :changes 0))
+      (resp/simple "OK"))))
+
+(defn- cmd-bgsave [ctx _args]
+  (cond
+    (nil? (:rdb-file ctx)) (resp/error "ERR RDB is not configured")
+    (nil? (:start-bgsave ctx)) (resp/error "ERR BGSAVE is not supported in this context")
+    @(:bgsave-running? ctx) (resp/error "ERR Background save already in progress")
+    :else
+    (let [prepared (rdb-snapshot ctx)]
+      (reset! (:bgsave-running? ctx) true)
+      ((:start-bgsave ctx) prepared)
+      (resp/simple "Background saving started"))))
+
+(defn- cmd-lastsave [ctx _args]
+  (or (some-> (:rdb-stats ctx) deref :last-save) 0))
 
 (def command-table
   {"PING"    {:arity -1 :write? false :denyoom? false :handler cmd-ping}
@@ -894,6 +927,10 @@
    "OBJECT"  {:arity -2 :write? false :denyoom? false :handler cmd-object}
    "INFO"    {:arity -1 :write? false :denyoom? false :handler cmd-info}
    "BGREWRITEAOF" {:arity 1 :write? false :denyoom? false :handler cmd-bgrewriteaof}
+
+   "SAVE"     {:arity 1 :write? false :denyoom? false :handler cmd-save}
+   "BGSAVE"   {:arity -1 :write? false :denyoom? false :handler cmd-bgsave}
+   "LASTSAVE" {:arity 1 :write? false :denyoom? false :handler cmd-lastsave}
 
    "DEL"     {:arity -2 :write? true  :denyoom? false :handler cmd-del}
    "EXISTS"  {:arity -2 :write? false :denyoom? false :handler cmd-exists}
