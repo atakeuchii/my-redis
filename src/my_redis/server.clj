@@ -83,7 +83,6 @@
          ^File aof-file (io/file (or dir ".") "appendonly.aof")
          aof-base-size (atom (if appendonly (.length aof-file) 0))
          base-ctx {:db keyspace :config cfg :stats (atom {:commands 0})}
-         _ (when appendonly (load-aof! aof-file base-ctx log))
          aof-ref (atom (when appendonly (aof/open! aof-file appendfsync)))
          rewriting? (atom false)
          ex-ref (atom nil)
@@ -104,6 +103,9 @@
          _ (if appendonly
              (load-aof! aof-file base-ctx log)
              (load-rdb! rdb-file base-ctx log))
+         _ (when appendonly
+             (reset! aof-base-size (.length aof-file))
+             (reset! aof-ref (aof/open! aof-file appendfsync)))
          start-save (fn [prepared]
                       (future
                         (try
@@ -159,7 +161,8 @@
 
 (defn stop! [state]
   (swap! state assoc :running? false)
-  (let [{:keys [^ServerSocket socket connections executor expiry aof-ref]} @state]
+  (let [{:keys [^ServerSocket socket connections executor expiry aof-ref verbose?]} @state
+        log (fn [& args] (when verbose? (apply println args)))]
     (expiry/stop! expiry)
     (doseq [^Socket c connections]
       (try
@@ -169,6 +172,6 @@
       (.close socket)
       (catch Exception _ nil))
     (executor/stop! executor)
-    (when-let [a @aof-ref] (aof/close! a)))
-  (println "[server] stop requested")
+    (when-let [a @aof-ref] (aof/close! a))
+    (log "[server] stop requested"))
   nil)
