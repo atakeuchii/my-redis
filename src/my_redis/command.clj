@@ -1174,7 +1174,6 @@
        (let [raw (first cmd)
              name (str/upper-case raw)
              spec (get command-table name)]
-         (println "[dbg]" (pr-str cmd))
          (cond
            (nil? spec)
            (resp/error (str "ERR unknown command '" raw "'"))
