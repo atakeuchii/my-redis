@@ -5,6 +5,7 @@
             [my-redis.db :as db]
             [my-redis.config :as config]
             [my-redis.eviction :as eviction]
+            [my-redis.pubsub :as pubsub]
             [my-redis.rdb :as rdb]
             [my-redis.rewrite :as rewrite]
             [my-redis.types.list :as dlist]
@@ -34,6 +35,9 @@
 
 (def ^:private oom-error
   (resp/error "OOM command not allowed when used memory > 'maxmemory'."))
+
+(def ^:private subscribe-mode-allowed
+  #{"SUBSCRIBE" "UNSUBSCRIBE" "PING" "QUIT"})
 
 (defn- byte-length ^long [^String s]
   (alength (.getBytes s "UTF-8")))
@@ -916,6 +920,75 @@
 (defn- cmd-lastsave [ctx _args]
   (or (some-> (:rdb-stats ctx) deref :last-save) 0))
 
+;; ---------- Pub/Sub ----------
+
+(defn- subscribe-reply
+  [kind channel ^long n]
+  [kind channel n])
+
+(defn- cmd-subscribe [ctx channels]
+  (let [reg    (:pubsub ctx)
+        client (:client ctx)]
+    (cond
+      (nil? reg)    (resp/error "ERR Pub/Sub is not available in this context")
+      (nil? client) (resp/error "ERR SUBSCRIBE requires a client connection")
+      :else
+      [:multi (mapv (fn [ch]
+                      (subscribe-reply "subscribe" ch
+                                       (pubsub/subscribe! reg client ch)))
+                    channels)])))
+
+(defn- cmd-unsubscribe [ctx channels]
+  (let [reg    (:pubsub ctx)
+        client (:client ctx)]
+    (cond
+      (nil? reg)    (resp/error "ERR Pub/Sub is not available in this context")
+      (nil? client) (resp/error "ERR UNSUBSCRIBE requires a client connection")
+      :else
+      (let [targets (if (seq channels)
+                      channels
+                      (vec (pubsub/channels-of reg client)))]
+        (if (empty? targets)
+          ;; 購読していない状態で引数なし UNSUBSCRIBE を打った場合
+          [:multi [(subscribe-reply "unsubscribe" nil 0)]]
+          [:multi (mapv (fn [ch]
+                          (subscribe-reply "unsubscribe" ch
+                                           (pubsub/unsubscribe! reg client ch)))
+                        targets)])))))
+
+(defn- cmd-publish [ctx [channel message]]
+  (let [reg (:pubsub ctx)]
+    (if (nil? reg)
+      (resp/error "ERR Pub/Sub is not available in this context")
+      (let [subs (pubsub/subscribers-of reg channel)]
+        (doseq [c subs]
+          (try
+            (pubsub/send-push! c ["message" channel message])
+            (catch Exception e
+              ;; 配信に失敗しても他の購読者への配信は続ける。
+              ;; 切断済みの接続は、その接続スレッドの finally が掃除する。
+              (println "[pubsub] delivery failed:" (.getMessage e)))))
+        (count subs)))))
+
+(defn- cmd-pubsub [ctx [subcmd & args]]
+  (let [reg (:pubsub ctx)
+        sub (str/upper-case (or subcmd ""))]
+    (if (nil? reg)
+      (resp/error "ERR Pub/Sub is not available in this context")
+      (case sub
+        "CHANNELS"
+        (let [all (keys (:channels @reg))]
+          (if-let [pat (first args)]
+            (let [re (glob->regex pat)]
+              (into [] (filter #(re-matches re %)) all))
+            (vec all)))
+
+        "NUMSUB"
+        (into [] (mapcat (fn [ch] [ch (count (pubsub/subscribers-of reg ch))])) args)
+
+        (resp/error (str "ERR Unknown PUBSUB subcommand or wrong number of arguments for '"
+                         subcmd "'"))))))
+
 (def command-table
   {"PING"    {:arity -1 :write? false :denyoom? false :handler cmd-ping}
    "ECHO"    {:arity  2 :write? false :denyoom? false :handler cmd-echo}
@@ -999,7 +1072,12 @@
    "PEXPIREAT" {:arity 3 :write? true  :denyoom? false :handler cmd-pexpireat}
    "TTL"       {:arity 2 :write? false :denyoom? false :handler cmd-ttl}
    "PTTL"      {:arity 2 :write? false :denyoom? false :handler cmd-pttl}
-   "PERSIST"   {:arity 2 :write? true  :denyoom? false :handler cmd-persist}})
+   "PERSIST"   {:arity 2 :write? true  :denyoom? false :handler cmd-persist}
+   
+   "SUBSCRIBE"   {:arity -2 :write? false :denyoom? false :handler cmd-subscribe}
+   "UNSUBSCRIBE" {:arity -1 :write? false :denyoom? false :handler cmd-unsubscribe}
+   "PUBLISH"     {:arity  3 :write? false :denyoom? false :handler cmd-publish}
+   "PUBSUB"      {:arity -2 :write? false :denyoom? false :handler cmd-pubsub}})
 
 (defn- arity-ok? [^long arity ^long n]
   (if (neg? arity)
@@ -1062,57 +1140,72 @@
       ((:start-rewrite ctx) prepared)
       (println "[aof] auto rewrite triggered"))))
 
-(defn dispatch [ctx cmd]
-  (cond
-    (= cmd [:expire-cycle])
-    (let [n (db/expire-cycle! (:db ctx) 1)]
-      (flush-pending-dels! ctx)
-      (maybe-auto-rewrite! ctx)
-      n)
+(defn- in-subscribe-mode? [ctx]
+  (boolean (when-let [reg (:pubsub ctx)]
+             (when-let [client (:client ctx)]
+               (pubsub/subscribed? reg client)))))
 
-    (and (vector? cmd) (= :commit-rewrite (first cmd)))
-    (let [built  (second cmd)
-          result (rewrite/commit! built (:aof-file ctx))
-          old    (current-aof ctx)
-          new    (aof/open! (:aof-file ctx) (:appendfsync ctx))]
-      (reset! (:aof-ref ctx) new)
-      (when old (aof/close! old))
-      (when-let [b (:aof-base-size ctx)]
-        (reset! b (:new-size result)))
-      result)
+(defn dispatch
+  ([ctx cmd] (dispatch ctx cmd nil))
+  ([ctx cmd client]
+   (let [ctx (if client (assoc ctx :client client) ctx)]
+     (cond
+       (= cmd [:expire-cycle])
+       (let [n (db/expire-cycle! (:db ctx) 1)]
+         (flush-pending-dels! ctx)
+         (maybe-auto-rewrite! ctx)
+         n)
 
-    (not (seq cmd))
-    :no-reply
+       (and (vector? cmd) (= :commit-rewrite (first cmd)))
+       (let [built  (second cmd)
+             result (rewrite/commit! built (:aof-file ctx))
+             old    (current-aof ctx)
+             new    (aof/open! (:aof-file ctx) (:appendfsync ctx))]
+         (reset! (:aof-ref ctx) new)
+         (when old (aof/close! old))
+         (when-let [b (:aof-base-size ctx)]
+           (reset! b (:new-size result)))
+         result)
 
-    :else
-    (let [raw (first cmd)
-          name (str/upper-case raw)
-          spec (get command-table name)]
-      (cond
-        (nil? spec)
-        (resp/error (str "ERR unknown command '" raw "'"))
+       (not (seq cmd))
+       :no-reply
 
-        (not (arity-ok? (:arity spec) (count cmd)))
-        (resp/error (str "ERR wrong number of arguments for '" (str/lower-case name) "' command"))
+       :else
+       (let [raw (first cmd)
+             name (str/upper-case raw)
+             spec (get command-table name)]
+         (println "[dbg]" (pr-str cmd))
+         (cond
+           (nil? spec)
+           (resp/error (str "ERR unknown command '" raw "'"))
 
-        (and (:denyoom? spec)
-             (not (:replaying? ctx))
-             (not (eviction/ensure-capacity! (:db ctx) (:config ctx))))
-        oom-error
+           (not (arity-ok? (:arity spec) (count cmd)))
+           (resp/error (str "ERR wrong number of arguments for '" (str/lower-case name) "' command"))
 
-        :else
-        (let [args (vec (rest cmd))
-              reply (try
-                      (when-let [s (:stats ctx)] (swap! s update :commands inc))
-                      ((:handler spec) ctx args)
-                      (catch Exception e
-                        (println "[command] error in" name ":" (.getMessage e))
-                        (resp/error "ERR internal error")))]
-          (flush-pending-dels! ctx)
-          (when-let [a (and (:write? spec)
-                            (state-changed? reply)
-                            (not (:replaying? ctx))
-                            (current-aof ctx))]
-            (doseq [c (aof-commands ctx name args reply)]
-              (aof/append! a c)))
-          reply)))))
+           (and (in-subscribe-mode? ctx)
+                (not (subscribe-mode-allowed name)))
+           (resp/error (str "ERR Can't execute '" (str/lower-case name)
+                            "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET "
+                            "are allowed in this context"))
+
+           (and (:denyoom? spec)
+                (not (:replaying? ctx))
+                (not (eviction/ensure-capacity! (:db ctx) (:config ctx))))
+           oom-error
+
+           :else
+           (let [args (vec (rest cmd))
+                 reply (try
+                         (when-let [s (:stats ctx)] (swap! s update :commands inc))
+                         ((:handler spec) ctx args)
+                         (catch Exception e
+                           (println "[command] error in" name ":" (.getMessage e))
+                           (resp/error "ERR internal error")))]
+             (flush-pending-dels! ctx)
+             (when-let [a (and (:write? spec)
+                               (state-changed? reply)
+                               (not (:replaying? ctx))
+                               (current-aof ctx))]
+               (doseq [c (aof-commands ctx name args reply)]
+                 (aof/append! a c)))
+             reply)))))))

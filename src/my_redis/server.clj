@@ -6,45 +6,68 @@
             [my-redis.config :as config]
             [my-redis.executor :as executor]
             [my-redis.expiry :as expiry]
+            [my-redis.pubsub :as pubsub]
             [my-redis.rdb :as rdb]
             [my-redis.rewrite :as rewrite]
             [my-redis.resp :as resp])
   (:import [java.net ServerSocket Socket SocketException]
            [java.io BufferedInputStream BufferedOutputStream EOFException File]))
 
+(defrecord SocketClient [id ^BufferedOutputStream out lock]
+  pubsub/IClient
+  (send-push! [_ payload]
+    (locking lock
+      (resp/write-reply! out payload)
+      (.flush out)))
+  (client-id [_] id))
+
 (defn- serve-connection!
   [server-state ^Socket sock]
-  (try
-    (.setTcpNoDelay sock true)
-    (swap! server-state update :connections conj sock)
-    (let [in (BufferedInputStream. (.getInputStream sock))
-          out (BufferedOutputStream. (.getOutputStream sock))
-          ex (:executor @server-state)]
-      (loop []
-        (let [cmd (resp/read-reply in)
-              reply (executor/submit! ex cmd)]
-          (cond
-            (= reply :no-reply)
-            (recur)
+  (let [client-id (str (.getRemoteSocketAddress sock) "-" (System/nanoTime))
+        lock (Object.)]
+    (try
+      (.setTcpNoDelay sock true)
+      (swap! server-state update :connections conj sock)
+      (let [in (BufferedInputStream. (.getInputStream sock))
+            out (BufferedOutputStream. (.getOutputStream sock))
+            client (->SocketClient client-id out lock)
+            ex (:executor @server-state)
+            write! (fn [reply]
+                     (locking lock
+                       (resp/write-reply! out reply)
+                       (.flush out)))]
+        (loop []
+          (let [cmd (resp/read-reply in)
+                reply (executor/submit! ex {:cmd cmd :client client})]
+            (cond
+              (= reply :no-reply)
+              (recur)
 
-            (= reply :quit)
-            (do (resp/write-reply! out (resp/simple "OK"))
-                (.flush out))
+              (= reply :quit)
+              (write! (resp/simple "OK"))
 
-            :else
-            (do (resp/write-reply! out reply)
-                (.flush out)
-                (recur))))))
-    (catch EOFException _ nil) ; クライアントが切断。正常終了
-    (catch SocketException _ nil) ; 接続が切れた。正常終了
-    (catch IllegalStateException _ nil) ; executor 停止後の submit!
-    (catch Exception e
-      (println "[server] connection error:" (.getMessage e)))
-    (finally
-      (swap! server-state update :connections disj sock)
-      (try
-        (.close sock)
-        (catch Exception _ nil)))))
+              (and (vector? reply) (= :multi (first reply)))
+              (do (locking lock
+                    (doseq [r (second reply)]
+                      (resp/write-reply! out r))
+                    (.flush out))
+                  (recur))
+
+              :else
+              (do (write! reply)
+                  (recur))))))
+      (catch EOFException _ nil) ; クライアントが切断。正常終了
+      (catch SocketException _ nil) ; 接続が切れた。正常終了
+      (catch IllegalStateException _ nil) ; executor 停止後の submit!
+      (catch Exception e
+        (println "[server] connection error:" (.getMessage e)))
+      (finally
+        (when-let [reg (:pubsub @server-state)]
+          (pubsub/unsubscribe-all-by-id! reg client-id))
+        (swap! server-state update :connections disj sock)
+        (try
+          (.close sock)
+          (catch Exception _ nil))))))
 
 (defn- load-aof!
   [^File file ctx log]
@@ -117,6 +140,7 @@
                           (catch Exception e
                             (println "[rdb] bgsave failed:" (.getMessage e)))
                           (finally (reset! bgsaving? false)))))
+         pubsub-reg (pubsub/create)
          ctx (assoc base-ctx
                     :aof-ref aof-ref
                     :aof-file aof-file
@@ -127,8 +151,12 @@
                     :rdb-file rdb-file
                     :rdb-stats rdb-stats
                     :bgsave-running? bgsaving?
-                    :start-bgsave start-save)
-         ex (executor/start! (fn [cmd] (command/dispatch ctx cmd)))
+                    :start-bgsave start-save
+                    :pubsub pubsub-reg)
+         ex (executor/start! (fn [task]
+                               (if (map? task)
+                                 (command/dispatch ctx (:cmd task) (:client task))
+                                 (command/dispatch ctx task))))
          _ (reset! ex-ref ex)
          cycler (expiry/start! (fn [] (executor/submit! ex [:expire-cycle]))
                                {:interval-ms expire-interval-ms})
@@ -143,7 +171,8 @@
                       :aof-base-size aof-base-size
                       :executor ex
                       :expiry cycler
-                      :rdb-file rdb-file})]
+                      :rdb-file rdb-file
+                      :pubsub pubsub-reg})]
      (future
        (try
          (log (format "[server] listening on %d" actual-port))
