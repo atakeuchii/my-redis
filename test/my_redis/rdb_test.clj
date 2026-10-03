@@ -5,9 +5,8 @@
             [my-redis.db :as db]
             [my-redis.executor :as executor]
             [my-redis.rdb :as rdb]
-            [my-redis.resp :as resp]
             [my-redis.server :as server])
-  (:import [java.io File]
+  (:import [java.io File FileOutputStream]
            [java.nio.file Files OpenOption]))
 
 (defn- ctx []
@@ -19,7 +18,7 @@
   (doto (File/createTempFile "myredis-rdb" "") (.delete) (.mkdir)))
 
 (defn- delete-tree [^File dir]
-  (doseq [f (reverse (file-seq dir))] (.delete f)))
+  (doseq [^File f (reverse (file-seq dir))] (.delete f)))
 
 (defn- roundtrip
   "ctx の状態を RDB に書いて読み戻し、新しい ctx を返す。"
@@ -128,10 +127,15 @@
 
 ;; ---------- 破損の検出 ----------
 
+(defn- write-bytes!
+  [^File f ^bytes bs]
+  (with-open [out (FileOutputStream. f)]
+    (.write out bs)))
+
 (defn- corrupt-byte! [^File src ^File dest ^long idx]
   (let [bs (Files/readAllBytes (.toPath src))]
     (aset-byte bs idx (if (zero? (aget bs idx)) (byte 1) (byte 0)))
-    (Files/write (.toPath dest) bs (into-array OpenOption []))))
+    (write-bytes! dest bs)))
 
 (deftest corrupted-file-is-rejected
   (let [c (ctx)
@@ -151,8 +155,7 @@
 (deftest bad-magic-is-rejected
   (let [f (File/createTempFile "notrdb" ".rdb")]
     (try
-      (Files/write (.toPath f) (.getBytes "this is not an rdb file at all" "UTF-8")
-                   (into-array OpenOption []))
+      (write-bytes! f (.getBytes "this is not an rdb file at all" "UTF-8"))
       (is (thrown? clojure.lang.ExceptionInfo (rdb/load-commands f)))
       (finally (.delete f)))))
 
@@ -164,8 +167,7 @@
       (dotimes [i 20] (run c "SET" (str "k" i) "v"))
       (rdb/write-file! f (:data @(:db c)) (db/now))
       (let [bs (Files/readAllBytes (.toPath f))]
-        (Files/write (.toPath t) (java.util.Arrays/copyOfRange bs 0 (- (alength bs) 20))
-                     (into-array OpenOption [])))
+        (write-bytes! t (java.util.Arrays/copyOfRange bs 0 (- (alength bs) 20))))
       (is (thrown? clojure.lang.ExceptionInfo (rdb/load-commands t)))
       (finally (.delete f) (.delete t)))))
 
