@@ -1,4 +1,4 @@
-(defproject my-redis (or (System/getenv "RELEASE_VERSION") "0.1.0-SNAPSHOT")
+(defproject atakeuchii/my-redis (or (System/getenv "RELEASE_VERSION") "0.1.0-SNAPSHOT")
   :description "A minimal Redis implementation in Clojure"
   :url "https://github.com/atakeuchii/my-redis"
   :license {:name "EPL-2.0 OR GPL-2.0-or-later WITH Classpath-exception-2.0"
